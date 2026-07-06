@@ -24,6 +24,15 @@
   h2 { font-size:17px; margin-top:34px; }
   .note { background:#161c24; border:1px solid #232a33; border-radius:8px; padding:14px 16px; font-size:13px; color:#b8c0cb; }
   code { background:#161c24; padding:1px 5px; border-radius:4px; font-size:12.5px; }
+  .stage { position:relative; border-radius:10px; overflow:hidden; background:#000; margin-bottom:8px; }
+  #bubble { display:block; width:100%; touch-action:none; cursor:grab; }
+  #bubble:active { cursor:grabbing; }
+  #bubble-overlay { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+                    color:#9aa4b2; font-size:14px; background:rgba(14,17,22,.75); pointer-events:none; }
+  #bubble-overlay.hidden { display:none; }
+  #bubble-overlay.err { color:#ff8d5d; }
+  .hint { color:#9aa4b2; font-size:12.5px; margin:0 0 20px; }
+  .preview { margin-top:4px; }
 </style>
 </head>
 <body><div class="wrap">
@@ -31,6 +40,12 @@
 <div class="sub">One licensed 360&deg; pano &rarr; layered 3D Gaussian splat, built by the
 <a style="color:#7ab7ff" href="https://github.com/phdev/Scenic">Scenic</a> deterministic pipeline.
 442,746 splats &middot; 2.7&nbsp;MB .sog &middot; DC-only SH &middot; fg/bg/shell layers</div>
+
+<div class="stage">
+  <canvas id="bubble"></canvas>
+  <div id="bubble-overlay">loading splat &hellip;</div>
+</div>
+<div class="hint">drag = look &middot; wheel = zoom &middot; WASD/QE = move inside the certified head-box (&plusmn;0.5&nbsp;m lateral, +0.2/&minus;1.0&nbsp;m vertical) &middot; double-click = fullscreen &middot; rendered by vendored <a style="color:#7ab7ff" href="https://github.com/playcanvas/engine">PlayCanvas 2.20.5</a> (MIT)</div>
 
 <img class="preview" src="preview.jpg" alt="four rendered views of the splat">
 
@@ -65,4 +80,7 @@ verified); nadir watermark pre-cleaned at source; metric scale operator-supplied
 Detector: RT-DETR r18 (Apache-2.0). Source pano is owner-licensed and not included in
 the repository.
 </div>
-</div></body></html>
+</div>
+<script src="vendor/playcanvas-2.20.5.min.js"></script>
+<script src="viewer.js"></script>
+</body></html>
