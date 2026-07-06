@@ -10,3 +10,4 @@ tools/node/node_modules/
 *.egg-info/
 .DS_Store
 .gstack/
+local_panos/

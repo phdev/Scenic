@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scenic — Machu Picchu scenic bubble</title>
+<style>
+  body { margin:0; background:#0e1116; color:#e6e8eb; font:15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 32px 20px 60px; }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  .sub { color:#9aa4b2; margin-bottom: 24px; }
+  .preview { width:100%; border-radius:10px; display:block; }
+  .cta { display:inline-block; margin:22px 0 8px; padding:14px 26px; background:#f60; color:#fff;
+         font-weight:700; font-size:17px; border-radius:8px; text-decoration:none; }
+  .cta:hover { background:#ff7d26; }
+  .alt { color:#9aa4b2; font-size:13px; margin-bottom:28px; }
+  .alt a { color:#7ab7ff; }
+  table { border-collapse: collapse; width:100%; font-size:13px; margin-top:8px; }
+  td, th { text-align:left; padding:7px 10px; border-bottom:1px solid #232a33; }
+  th { color:#9aa4b2; font-weight:600; }
+  .ok { color:#3fcf6e; font-weight:700; }
+  .bad { color:#ff5d5d; font-weight:700; }
+  .dim { color:#9aa4b2; }
+  h2 { font-size:17px; margin-top:34px; }
+  .note { background:#161c24; border:1px solid #232a33; border-radius:8px; padding:14px 16px; font-size:13px; color:#b8c0cb; }
+  code { background:#161c24; padding:1px 5px; border-radius:4px; font-size:12.5px; }
+</style>
+</head>
+<body><div class="wrap">
+<h1>Scenic — Machu Picchu scenic bubble</h1>
+<div class="sub">One licensed 360&deg; pano &rarr; layered 3D Gaussian splat, built by the
+<a style="color:#7ab7ff" href="https://github.com/phdev/Scenic">Scenic</a> deterministic pipeline.
+442,746 splats &middot; 2.7&nbsp;MB .sog &middot; DC-only SH &middot; fg/bg/shell layers</div>
+
+<img class="preview" src="preview.jpg" alt="four rendered views of the splat">
+
+<a class="cta" href="https://superspl.at/editor?load=https%3A%2F%2Fphdev.github.io%2FScenic%2Fscene.sog">&#9658;&nbsp; Open in SuperSplat</a>
+<div class="alt">Opens <code>superspl.at/editor</code> and streams
+<a href="scene.sog">scene.sog</a> (2.7 MB) from this page.</div>
+
+<h2>Gate verdicts (this run)</h2>
+<table>
+<tr><th>Gate</th><th>Stage</th><th>Verdict</th><th>Key metrics</th></tr>
+<tr><td>watermark</td><td class="dim">s0_ingest</td><td class="ok">PASS</td><td class="dim">edge_density=0</td></tr>
+<tr><td>cleanplate_detector</td><td class="dim">s1_cleanplate</td><td class="ok">PASS</td><td class="dim">hits=0</td></tr>
+<tr><td>cleanplate_containment</td><td class="dim">s1_cleanplate</td><td class="ok">PASS</td><td class="dim">diff_px=85750, diff_px_outside_mask=0</td></tr>
+<tr><td>ground_plane</td><td class="dim">s2b_scale</td><td class="ok">PASS</td><td class="dim">cone_px=524288, h_rel=0.07028, inlier_px=513539</td></tr>
+<tr><td>min_content_distance</td><td class="dim">s2b_scale</td><td class="bad">FAIL</td><td class="dim">band_finite_px=267787, band_px=290816, near_distance_m=3.151</td></tr>
+<tr><td>hole</td><td class="dim">s7_gates</td><td class="ok">PASS</td><td class="dim">n_views=28, worst_alpha_below_skyline_frac=0.001725, worst_blob_px=47</td></tr>
+<tr><td>jitter</td><td class="dim">s7_gates</td><td class="ok">PASS</td><td class="dim">energy=0.0002034</td></tr>
+<tr><td>stereo</td><td class="dim">s7_gates</td><td class="bad">FAIL</td><td class="dim">min_depth_m=2.034, order_min_frac=0.963, vdisp_max_px=0.2521</td></tr>
+<tr><td>people</td><td class="dim">s7_gates</td><td class="ok">PASS</td><td class="dim">max_score=0.3213, n_detections=0</td></tr>
+<tr><td>budgets</td><td class="dim">s7_gates</td><td class="ok">PASS</td><td class="dim">compress_final_count=442746, compress_sog_bytes=2735454, count_vs_target_ratio=0.7379</td></tr>
+</table>
+
+<div class="note" style="margin-top:16px">
+<b>Two honest FAILs.</b> This location has stone walls ~3.1&nbsp;m from the camera at eye
+level, under the pipeline's 6&nbsp;m comfort minimum for a &plusmn;0.5&nbsp;m VR head-box, and the
+close content also stresses the stereo depth-order check. The asset is published for
+inspection; per the receipts it is <b>not</b> ship-grade for Quest comfort. Provenance:
+person removed via the S1 cleanplate loop (detector re-run = 0 hits, edit containment
+verified); nadir watermark pre-cleaned at source; metric scale operator-supplied
+(terraced slope defeats the ground-plane fit, tilt 21.6&deg;). Manifest
+<code>fd01b9e1e82bd567&hellip;</code>. Depth: Depth-Anything-V2-Small (Apache-2.0).
+Detector: RT-DETR r18 (Apache-2.0). Source pano is owner-licensed and not included in
+the repository.
+</div>
+</div></body></html>
