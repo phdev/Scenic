@@ -1,0 +1,6 @@
+{
+  "camera_height_m": 1.6,
+  "license_id": "CC0-1.0",
+  "scope_note": "procedurally generated, no third-party content",
+  "source": "synthetic \u2014 tools/make_fixtures.py"
+}

@@ -1,0 +1,74 @@
+# Scenic CI: lint-free determinism-first pipeline checks.
+#
+# Commands here are the documented repo contracts (Makefile / CLAUDE.md):
+# setup (uv sync + npm ci), fetch-weights (network OK at CI setup time only,
+# cached on pins.json), license guard, no-network static guard, byte-stable
+# fixtures, full pytest suite, and the double-run determinism acceptance gate.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  UV_PYTHON: "3.12"
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Cache pinned weights
+        uses: actions/cache@v4
+        with:
+          path: weights
+          key: weights-${{ hashFiles('weights/pins.json') }}
+
+      - name: uv sync
+        run: uv sync
+
+      - name: npm ci (splat-transform)
+        working-directory: tools/node
+        run: npm ci
+
+      # Network is allowed ONLY here (setup time). After the first run the
+      # weights/ cache hit makes this a pure hash-verify pass.
+      - name: Fetch + verify pinned weights
+        run: uv run python tools/fetch_weights.py
+
+      - name: License guard
+        run: uv run python tools/license_guard.py
+
+      - name: No-network static guard
+        run: uv run python tools/check_no_network.py
+
+      # Fixtures must be byte-stable against what is committed.
+      - name: Fixtures byte-stable
+        run: |
+          uv run python tools/make_fixtures.py
+          git diff --exit-code fixtures/
+
+      - name: Test suite
+        run: uv run pytest
+
+      # Acceptance gate: run the full pipeline twice on the tiny fixture and
+      # assert bit-identical manifests (mirrors `make determinism-check`).
+      - name: Determinism acceptance (double run, hash-equal)
+        run: |
+          rm -rf runs/_det_a runs/_det_b
+          uv run python -m scenic.run --pano fixtures/ci_tiny.jpg --out runs/_det_a
+          uv run python -m scenic.run --pano fixtures/ci_tiny.jpg --out runs/_det_b
+          uv run python tools/compare_runs.py runs/_det_a runs/_det_b

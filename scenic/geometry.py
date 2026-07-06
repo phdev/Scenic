@@ -53,7 +53,7 @@ def rotation_yaw_pitch(yaw: float, pitch: float) -> np.ndarray:
     cy, sy = np.cos(yaw), np.sin(yaw)
     cp, sp = np.cos(pitch), np.sin(pitch)
     ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], dtype=np.float64)
-    rp = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]], dtype=np.float64)
+    rp = np.array([[1, 0, 0], [0, cp, sp], [0, -sp, cp]], dtype=np.float64)
     return ry @ rp
 
 
@@ -137,15 +137,18 @@ def normals_from_depth(depth: np.ndarray, dirs: np.ndarray) -> np.ndarray:
     """Per-pixel unit normal from 3D point grid (central differences),
     oriented to face the origin. Invalid depths propagate NaN-free: falls
     back to -dir (facing camera)."""
-    pts = dirs * depth[..., None]
     finite = np.isfinite(depth)
+    pts = dirs * np.where(finite, depth, 0.0)[..., None]
     dx = np.zeros_like(pts)
     dy = np.zeros_like(pts)
     dx[:, 1:-1] = pts[:, 2:] - pts[:, :-2]
     dy[1:-1, :] = pts[2:, :] - pts[:-2, :]
     n = np.cross(dx, dy)
     norm = np.linalg.norm(n, axis=-1, keepdims=True)
-    good = (norm[..., 0] > 1e-12) & finite
+    finite_nbrs = np.ones_like(finite)
+    finite_nbrs[:, 1:-1] &= finite[:, 2:] & finite[:, :-2]
+    finite_nbrs[1:-1, :] &= finite[2:, :] & finite[:-2, :]
+    good = (norm[..., 0] > 1e-12) & finite & finite_nbrs
     n = np.where(good[..., None], n / np.maximum(norm, 1e-12), -dirs)
     flip = np.sum(n * dirs, axis=-1) > 0
     n = np.where(flip[..., None], -n, n)

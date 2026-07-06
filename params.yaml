@@ -46,6 +46,7 @@ s2b:
   plane_tilt_max_deg: 15.0
   residual_max_rel: 0.15
   horizon_band_deg: 20.0
+  horizon_band_down_deg: 5.0   # flat ground at -5deg/1.6m camera is ~18m; below that ground is legitimately near
   near_percentile: 2.0
 
 s3:
