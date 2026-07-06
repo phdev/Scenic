@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "s0 nadir watermark/text verdict",
+  "type": "object",
+  "required": ["edge_density", "suspicious", "band_pitch_deg"],
+  "additionalProperties": true,
+  "properties": {
+    "edge_density": {"type": "number", "minimum": 0},
+    "suspicious": {"type": "boolean"},
+    "band_pitch_deg": {"type": "number"}
+  }
+}

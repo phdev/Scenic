@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "s8 review meta",
+  "type": "object",
+  "required": ["page", "poses", "compared_to_accepted"],
+  "additionalProperties": true,
+  "properties": {
+    "page": {"type": "string"},
+    "poses": {"type": "array", "items": {"type": "object"}},
+    "compared_to_accepted": {"type": "boolean"}
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "s1 cleanplate result",
+  "type": "object",
+  "required": ["mode", "detector_hits_after", "containment_ok"],
+  "additionalProperties": true,
+  "properties": {
+    "mode": {"enum": ["passthrough", "edited"]},
+    "detector_hits_after": {"type": "integer", "minimum": 0},
+    "containment_ok": {"type": "boolean"}
+  }
+}

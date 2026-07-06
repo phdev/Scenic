@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "scenic gate verdict",
+  "type": "object",
+  "required": ["gate", "pass", "metrics", "thresholds"],
+  "additionalProperties": false,
+  "properties": {
+    "gate": {"enum": ["hole", "jitter", "stereo", "people", "budgets", "cleanplate_detector", "cleanplate_containment", "min_content_distance", "ground_plane", "watermark", "license_sidecar"]},
+    "pass": {"type": "boolean"},
+    "metrics": {"type": "object", "additionalProperties": {"type": ["number", "integer", "boolean", "string", "array"]}},
+    "thresholds": {"type": "object", "additionalProperties": {"type": ["number", "integer", "boolean", "string"]}},
+    "details": {"type": ["object", "array", "string"]}
+  }
+}

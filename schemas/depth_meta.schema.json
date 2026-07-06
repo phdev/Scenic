@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "s2 depth meta",
+  "type": "object",
+  "required": ["backend", "faces", "fused_w", "fused_h", "out_w", "out_h", "overlap_residual_log"],
+  "additionalProperties": true,
+  "properties": {
+    "backend": {"type": "string"},
+    "fused_w": {"type": "integer"},
+    "fused_h": {"type": "integer"},
+    "out_w": {"type": "integer"},
+    "out_h": {"type": "integer"},
+    "overlap_residual_log": {"type": "number", "minimum": 0},
+    "faces": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "required": ["name", "affine_a", "affine_b"],
+        "additionalProperties": true,
+        "properties": {
+          "name": {"type": "string"},
+          "affine_a": {"type": "number"},
+          "affine_b": {"type": "number"}
+        }
+      }
+    }
+  }
+}

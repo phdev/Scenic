@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "s3 layers meta",
+  "type": "object",
+  "required": ["band_px", "band_derivation", "edge_px_count", "bg_filled_px"],
+  "additionalProperties": true,
+  "properties": {
+    "band_px": {"type": "integer", "minimum": 0},
+    "band_derivation": {"type": "object"},
+    "edge_px_count": {"type": "integer", "minimum": 0},
+    "bg_filled_px": {"type": "integer", "minimum": 0}
+  }
+}

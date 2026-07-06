@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+runs/
+weights/*
+!weights/LICENSES.md
+!weights/pins.json
+tools/node/node_modules/
+.pytest_cache/
+*.egg-info/
+.DS_Store

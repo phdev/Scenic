@@ -1,0 +1,91 @@
+# Canonical pipeline parameters. This file is hashed into every receipt.
+# No timestamps, no absolute paths, no machine-specific values allowed here.
+
+head_box:
+  lateral_m: 0.5          # +/- x and z
+  up_m: 0.2
+  down_m: 1.0
+
+camera_height_m_default: 1.6
+min_content_distance_m: 6.0
+
+splat_target: 600000
+splat_cap: 1000000
+sog_max_mb: 60
+sh_bands: 0               # DC only, ship invariant
+
+resolutions:
+  depth_face_px: 518        # DA-V2-Small native-friendly (14px multiple)
+  depth_equirect_w: 1024    # fused low-res depth before guided upsample
+  sampling_w: 2048          # sampling resolution ceiling (clamped to pano width)
+
+cubemap:
+  fov_deg: 100.0
+  overlap_min_weight: 0.02
+
+s0:
+  person_score_min: 0.5
+  horizon_views: 8
+  horizon_fov_deg: 90.0
+  cap_fov_deg: 100.0
+  view_px: 640
+  nadir_band_pitch_deg: -70.0
+  watermark_edge_density_max: 0.10
+  mask_dilate_px: 12
+
+s2:
+  sky_far_percentile: 90.0
+  sky_grad_max: 0.02
+  sky_min_pitch_deg: 0.0
+  guided_radius_px: 8
+  guided_eps: 0.0001
+
+s2b:
+  nadir_cone_pitch_deg: -45.0
+  irls_iters: 20
+  plane_tilt_max_deg: 15.0
+  residual_max_rel: 0.15
+  horizon_band_deg: 20.0
+  near_percentile: 2.0
+
+s3:
+  edge_log_grad_min: 0.30
+  band_extra_px: 2
+  pyramid_min_size: 4
+
+s4:
+  base_stride: 2
+  edge_boost: 4.0
+  ground_boost: 2.0
+  ground_band_pitch_deg: -20.0
+  scale_multiplier: 1.2
+  flatten_ratio: 0.15
+  shell_radius_m: 200.0
+  shell_stride: 4
+  fg_opacity: 0.98
+  bg_opacity: 0.95
+
+s6:
+  opacity_floor: 0.05
+  knn_k: 4
+  isolation_factor: 8.0
+  merge_dist_factor: 0.25
+  max_stride_retries: 4
+
+s7:
+  render_px: 512
+  render_fov_deg: 90.0
+  poses: 7                   # 6 head-box extremes + squat
+  squat_y_m: -0.9
+  hole_max_frac: 0.005
+  hole_blob_max_px: 400
+  hole_center_frac: 0.33
+  jitter_offset_m: 0.001
+  jitter_energy_max: 0.02
+  stereo_ipd_m: 0.063
+  stereo_vdisp_max_px: 0.5
+  stereo_near_depth_min_m: 0.75
+  stereo_order_min_frac: 0.98
+  people_score_min: 0.5
+
+seed: 0

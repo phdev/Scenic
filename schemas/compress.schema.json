@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "s6 compress meta",
+  "type": "object",
+  "required": ["in_count", "after_opacity_floor", "after_isolation_prune", "after_merge", "final_count", "stride_retries", "sog_bytes", "sog_tool"],
+  "additionalProperties": true,
+  "properties": {
+    "in_count": {"type": "integer", "minimum": 0},
+    "after_opacity_floor": {"type": "integer", "minimum": 0},
+    "after_isolation_prune": {"type": "integer", "minimum": 0},
+    "after_merge": {"type": "integer", "minimum": 0},
+    "final_count": {"type": "integer", "minimum": 0},
+    "stride_retries": {"type": "array", "items": {"type": "object"}},
+    "sog_bytes": {"type": "integer", "minimum": 0},
+    "sog_tool": {"type": "string"}
+  }
+}

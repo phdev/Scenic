@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "s2b metric scale",
+  "type": "object",
+  "required": ["scale_factor", "camera_height_m", "plane", "residual_rel", "tilt_deg", "scale_source"],
+  "additionalProperties": true,
+  "properties": {
+    "scale_factor": {"type": "number", "exclusiveMinimum": 0},
+    "camera_height_m": {"type": "number", "exclusiveMinimum": 0},
+    "scale_source": {"enum": ["ground_plane", "explicit"]},
+    "plane": {
+      "type": "object",
+      "required": ["normal", "d"],
+      "additionalProperties": false,
+      "properties": {
+        "normal": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+        "d": {"type": "number"}
+      }
+    },
+    "residual_rel": {"type": "number", "minimum": 0},
+    "tilt_deg": {"type": "number", "minimum": 0}
+  }
+}

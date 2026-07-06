@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "s0 pano meta",
+  "type": "object",
+  "required": ["width", "height", "source_sha256", "license", "camera_height_m"],
+  "additionalProperties": false,
+  "properties": {
+    "width": {"type": "integer", "minimum": 8},
+    "height": {"type": "integer", "minimum": 4},
+    "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "license": {"type": "object"},
+    "camera_height_m": {"type": "number", "exclusiveMinimum": 0}
+  }
+}

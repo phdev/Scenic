@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "s4 splats meta",
+  "type": "object",
+  "required": ["count", "counts_by_layer", "stride_multiplier"],
+  "additionalProperties": true,
+  "properties": {
+    "count": {"type": "integer", "minimum": 0},
+    "counts_by_layer": {
+      "type": "object",
+      "required": ["fg", "bg", "shell"],
+      "additionalProperties": false,
+      "properties": {
+        "fg": {"type": "integer", "minimum": 0},
+        "bg": {"type": "integer", "minimum": 0},
+        "shell": {"type": "integer", "minimum": 0}
+      }
+    },
+    "stride_multiplier": {"type": "number", "exclusiveMinimum": 0}
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "scenic stage receipt",
+  "type": "object",
+  "required": ["stage", "code", "inputs", "outputs", "params_used", "params_hash", "weights", "gates", "notes"],
+  "additionalProperties": false,
+  "properties": {
+    "stage": {"type": "string", "pattern": "^s[0-9]+b?_[a-z_]+$"},
+    "code": {
+      "type": "object",
+      "required": ["git_sha", "dirty"],
+      "additionalProperties": false,
+      "properties": {"git_sha": {"type": "string"}, "dirty": {"type": "boolean"}}
+    },
+    "inputs": {"$ref": "#/$defs/artifactMap"},
+    "outputs": {"$ref": "#/$defs/artifactMap"},
+    "params_used": {"type": "object"},
+    "params_hash": {"$ref": "#/$defs/sha256"},
+    "weights": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["key", "repo", "license", "license_url", "files_sha256"],
+        "additionalProperties": false,
+        "properties": {
+          "key": {"type": "string"},
+          "repo": {"type": "string"},
+          "license": {"enum": ["Apache-2.0", "MIT", "BSD-3-Clause"]},
+          "license_url": {"type": "string"},
+          "files_sha256": {"type": "object", "additionalProperties": {"$ref": "#/$defs/sha256"}}
+        }
+      }
+    },
+    "gates": {"type": "array", "items": {"type": "object"}},
+    "notes": {"type": "object"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "artifactMap": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["path", "sha256"],
+        "additionalProperties": false,
+        "properties": {
+          "path": {"type": "string", "pattern": "^[^/].*", "not": {"pattern": "^([A-Za-z]:)?/"}},
+          "sha256": {"$ref": "#/$defs/sha256"}
+        }
+      }
+    }
+  }
+}

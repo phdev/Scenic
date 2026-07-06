@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pano license sidecar (<pano>.license.json)",
+  "type": "object",
+  "required": ["source", "license_id", "scope_note"],
+  "additionalProperties": false,
+  "properties": {
+    "source": {"type": "string", "minLength": 1},
+    "license_id": {"type": "string", "minLength": 1},
+    "scope_note": {"type": "string", "minLength": 1},
+    "camera_height_m": {"type": "number", "exclusiveMinimum": 0, "maximum": 10}
+  }
+}

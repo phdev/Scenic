@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "scenic weight pins",
+  "type": "object",
+  "additionalProperties": {
+    "type": "object",
+    "required": ["repo", "revision", "license", "license_url", "files"],
+    "additionalProperties": false,
+    "properties": {
+      "repo": {"type": "string"},
+      "revision": {"type": "string"},
+      "license": {"enum": ["Apache-2.0", "MIT", "BSD-3-Clause"]},
+      "license_url": {"type": "string"},
+      "files": {
+        "type": "object",
+        "minProperties": 1,
+        "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

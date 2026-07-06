@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "scenic run manifest",
+  "type": "object",
+  "required": ["schema", "stages", "gate_summary", "shippable"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "scenic-manifest-v1"},
+    "stages": {"type": "array", "minItems": 1, "items": {"type": "object"}},
+    "gate_summary": {
+      "type": "object",
+      "required": ["total", "passed", "all_pass"],
+      "additionalProperties": false,
+      "properties": {
+        "total": {"type": "integer", "minimum": 0},
+        "passed": {"type": "integer", "minimum": 0},
+        "all_pass": {"type": "boolean"}
+      }
+    },
+    "shippable": {"type": "boolean"}
+  }
+}
