@@ -1,8 +1,9 @@
 UV := UV_PYTHON=3.12 uv
 PANO ?= fixtures/test.jpg
 OUT ?= runs/run
+FIXTURE ?= fixtures/ci_tiny.jpg
 
-.PHONY: setup fetch-weights fixtures test license-guard run determinism-check review clean
+.PHONY: setup fetch-weights fixtures test license-guard run determinism-check review accept clean sweep
 
 setup:
 	$(UV) sync
@@ -33,5 +34,16 @@ determinism-check:
 review:
 	open $(OUT)/s8_review/out/index.html
 
+# Promote a completed run to the runs/_accepted baseline that s8_review
+# compares against. Refuses shippable=false runs unless FORCE=1.
+accept:
+	@test -n "$(RUN)" || { echo "usage: make accept RUN=runs/<name> [FORCE=1]"; exit 2; }
+	$(UV) run python tools/accept_run.py $(RUN) $(if $(FORCE),--allow-failed-gates,)
+
 clean:
 	rm -rf runs
+
+# Deterministic parameter sweep over {s4.scale_multiplier, s4.base_stride,
+# s3.edge_depth_ratio_min, s3.band_px_max}; ranked report -> runs/_sweep/.
+sweep:
+	$(UV) run python tools/sweep.py --pano $(FIXTURE)

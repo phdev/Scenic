@@ -1,18 +1,25 @@
-"""s8_review tests.
+"""s8_review tests (v2 quality pass: toggles + SOG quant).
 
-Fixture: a fake run dir with a small synthetic scene.ply (a colored ring of
-splats around the origin, one color per quadrant), five minimal schema-valid
-s7 verdicts (one deliberately failing), a schema-valid compress.json and a
-scene.sog stub. No s7 renders -> s8 renders the 4 standard views itself.
+Fixture: a fake run dir with
+  * a two-profile schema-valid compress.json (profiles.review + profiles.quest,
+    each with ply_bytes/sog_bytes),
+  * six schema-valid s7 verdicts (one deliberately failing),
+  * scene.ply (primary/quest alias) + scene_review.*/scene_quest.* files,
+  * s7 layer renders center_yaw{NNN}_layer_{fg,bg,shell}.png.
 
-Covered: outputs + schema validity, page contents (five gate names, base64
-data URIs, params hash, SuperSplat note, PASS+FAIL), double-run byte-identical
-index.html across DIFFERENT run dirs (no absolute paths leak), the
-runs/_accepted side-by-side flow, byte-for-byte reuse of s7 renders, receipt
-shape, and hard errors on missing inputs.
+No base s7 center_yaw{NNN}.png -> s8 renders the 4 standard views itself.
+
+Covered: outputs + schema validity, page contents (all six gate names, base64
+data URIs, params hash, SuperSplat footer, PASS+FAIL, the fg/bg/shell toggle,
+the sog byte-ratio, the copied scene_review.sog viewer reference), review.json
+with layers + sog_ssim + profiles, double-run byte-identical index.html across
+DIFFERENT run dirs, the runs/_accepted side-by-side flow, missing-layer
+placeholder, byte-for-byte reuse of s7 renders, receipt shape, and hard errors
+on missing inputs.
 """
 from __future__ import annotations
 
+import base64
 import copy
 import shutil
 from pathlib import Path
@@ -27,11 +34,17 @@ from scenic.stage import Ctx
 
 REPO = Path(__file__).resolve().parent.parent
 
-GATES = ("budgets", "hole", "jitter", "people", "stereo")
+GATES = ("budgets", "fidelity_at_origin", "hole", "jitter", "people", "stereo")
 YAWS = (0, 90, 180, 270)
+LAYERS = ("fg", "bg", "shell")
 PX = 64                      # small render for fast tests
 N_RING = 48
-SOG_STUB = b"SOGSTUB" * 100  # scene.sog placeholder (s8 only reads its size)
+
+# distinct byte streams per profile so byte counts + ratios are meaningful
+REVIEW_SOG = b"REVIEWSOG" * 40
+QUEST_SOG = b"QUESTSOG" * 30
+REVIEW_PLY_BYTES = 900000
+QUEST_PLY_BYTES = 360000
 
 
 # ------------------------------------------------------------ fixture build
@@ -60,22 +73,51 @@ def make_splats() -> plyio.SplatData:
     )
 
 
-def make_run(d: Path) -> None:
+def _profile(final: int, sog_bytes: int, ply_bytes: int, target: int,
+             cap: int, sog_max_mb: float) -> dict:
+    return {
+        "in_count": final,
+        "after_opacity_floor": final,
+        "after_isolation_prune": final,
+        "after_merge": final,
+        "final_count": final,
+        "stride_retries": [],
+        "ply_bytes": ply_bytes,
+        "sog_bytes": sog_bytes,
+        "target": target,
+        "cap": cap,
+        "sog_max_mb": sog_max_mb,
+    }
+
+
+def make_run(d: Path, *, with_layer_renders: bool = True,
+             drop_layer: tuple[int, str] | None = None) -> None:
     s6 = d / "s6_compress" / "out"
     s6.mkdir(parents=True)
-    plyio.write_splats(s6 / "scene.ply", make_splats())
-    (s6 / "scene.sog").write_bytes(SOG_STUB)
+    splats = make_splats()
+    # primary alias (quest) + per-profile ply/sog
+    plyio.write_splats(s6 / "scene.ply", splats)
+    plyio.write_splats(s6 / "scene_quest.ply", splats)
+    plyio.write_splats(s6 / "scene_review.ply", splats)
+    (s6 / "scene.sog").write_bytes(QUEST_SOG)
+    (s6 / "scene_quest.sog").write_bytes(QUEST_SOG)
+    (s6 / "scene_review.sog").write_bytes(REVIEW_SOG)
     schema.write_validated(
         s6 / "compress.json",
         {
-            "in_count": N_RING,
-            "after_opacity_floor": N_RING,
-            "after_isolation_prune": N_RING,
-            "after_merge": N_RING,
-            "final_count": N_RING,
-            "stride_retries": [],
-            "sog_bytes": len(SOG_STUB),
             "sog_tool": "stub",
+            "primary_profile": "quest",
+            "viewer_profile": "review",
+            "profiles": {
+                "review": _profile(
+                    N_RING, len(REVIEW_SOG), REVIEW_PLY_BYTES,
+                    1500000, 2000000, 0,
+                ),
+                "quest": _profile(
+                    N_RING, len(QUEST_SOG), QUEST_PLY_BYTES,
+                    600000, 1000000, 60,
+                ),
+            },
         },
         "compress",
     )
@@ -93,6 +135,18 @@ def make_run(d: Path) -> None:
             },
             "gate_verdict",
         )
+    if with_layer_renders:
+        rdir = d / "s7_gates" / "out" / "renders"
+        rdir.mkdir(parents=True, exist_ok=True)
+        for y in YAWS:
+            for li, layer in enumerate(LAYERS):
+                if drop_layer is not None and drop_layer == (y, layer):
+                    continue
+                fill = 30 + 20 * li + (y // 90) * 3
+                arr = np.full((8, 8, 3), fill, np.uint8)
+                imageio.save_png(
+                    rdir / f"center_yaw{y:03d}_layer_{layer}.png", arr
+                )
 
 
 def make_ctx() -> Ctx:
@@ -136,23 +190,74 @@ def out(d: Path) -> Path:
 def test_outputs_exist(run_dir):
     assert (out(run_dir) / "index.html").exists()
     assert (out(run_dir) / "review.json").exists()
+    assert (out(run_dir) / "scene_review.sog").exists()
     for y in YAWS:
         assert (out(run_dir) / "thumbs" / f"{y}.png").exists()
 
 
-def test_index_contents(run_dir):
+def test_all_six_gate_names_on_page(run_dir):
     text = (out(run_dir) / "index.html").read_text()
     for g in GATES:
         assert g in text, f"gate name {g} missing from page"
+    # explicitly ensure the v2-added gates are present
+    assert "fidelity_at_origin" in text
+
+
+def test_index_core_contents(run_dir):
+    text = (out(run_dir) / "index.html").read_text()
     assert "data:image/png;base64," in text
     assert hashing.sha256_json(small_params()) in text  # run params hash
     assert str(N_RING) in text                          # splat counts
-    assert f"{len(SOG_STUB)} bytes" in text             # sog size
+    # both profile sog sizes surfaced in header
+    assert f"{len(REVIEW_SOG)} bytes" in text
+    assert f"{len(QUEST_SOG)} bytes" in text
     assert "superspl.at" in text                        # SuperSplat footer
     assert "PASS" in text and "FAIL" in text            # hole gate fails
     # self-contained + deterministic: no network fetches, no absolute paths
     assert "http" not in text.replace("https://superspl.at", "")
     assert str(run_dir) not in text
+
+
+def test_layer_toggle_present(run_dir):
+    text = (out(run_dir) / "index.html").read_text()
+    # fg/bg/shell toggle: buttons + the setLayer JS + gallery data-layer state
+    for layer in LAYERS:
+        assert f'data-layer="{layer}"' in text
+        assert f"setLayer('{layer}')" in text
+    assert "function setLayer" in text
+    assert 'id="gallery"' in text
+    # every layer render is embedded (4 yaws * 3 layers = 12 images present)
+    d = run_dir
+    for y in YAWS:
+        for layer in LAYERS:
+            png = (
+                d / "s7_gates" / "out" / "renders"
+                / f"center_yaw{y:03d}_layer_{layer}.png"
+            ).read_bytes()
+            assert base64.b64encode(png).decode("ascii") in text
+
+
+def test_sog_byte_ratio_shown(run_dir):
+    text = (out(run_dir) / "index.html").read_text()
+    assert "SOG byte ratio" in text
+    # per-profile ply/sog ratio values
+    review_ratio = f"{REVIEW_PLY_BYTES / len(REVIEW_SOG):.2f}x"
+    quest_ratio = f"{QUEST_PLY_BYTES / len(QUEST_SOG):.2f}x"
+    assert review_ratio in text
+    assert quest_ratio in text
+    # raw byte counts present
+    assert str(REVIEW_PLY_BYTES) in text
+    assert str(QUEST_PLY_BYTES) in text
+    # sog_ssim skipped -> decode-unavailable note surfaced
+    assert "decode unavailable" in text
+
+
+def test_viewer_references_review_sog(run_dir):
+    text = (out(run_dir) / "index.html").read_text()
+    assert "scene_review.sog" in text
+    assert "viewer_profile" in text
+    # the copied sog is a byte copy of s6's review sog
+    assert (out(run_dir) / "scene_review.sog").read_bytes() == REVIEW_SOG
 
 
 def test_review_json_schema_valid(run_dir):
@@ -162,6 +267,19 @@ def test_review_json_schema_valid(run_dir):
     assert [p["yaw_deg"] for p in r["poses"]] == list(YAWS)
     assert all(p["source"] == "rendered" for p in r["poses"])
     assert all(p["px"] == PX for p in r["poses"])
+    # v2 additions
+    assert r["sog_ssim"] is None
+    assert isinstance(r["layers"], list)
+    expected_layers = sorted(
+        f"center_yaw{y:03d}_layer_{layer}.png"
+        for y in YAWS
+        for layer in LAYERS
+    )
+    assert r["layers"] == expected_layers
+    assert set(r["profiles"]) == {"review", "quest"}
+    assert r["profiles"]["review"]["final_count"] == N_RING
+    assert r["profiles"]["review"]["sog_bytes"] == len(REVIEW_SOG)
+    assert r["profiles"]["quest"]["sog_bytes"] == len(QUEST_SOG)
 
 
 def test_thumbs_are_real_renders(run_dir):
@@ -172,8 +290,6 @@ def test_thumbs_are_real_renders(run_dir):
 
 
 def test_thumbs_embedded_in_page(run_dir):
-    import base64
-
     text = (out(run_dir) / "index.html").read_text()
     for y in YAWS:
         png = (out(run_dir) / "thumbs" / f"{y}.png").read_bytes()
@@ -191,10 +307,35 @@ def test_double_run_byte_identical(tmp_path):
     assert (out(d1) / "review.json").read_bytes() == (
         out(d2) / "review.json"
     ).read_bytes()
+    assert (out(d1) / "scene_review.sog").read_bytes() == (
+        out(d2) / "scene_review.sog"
+    ).read_bytes()
     for y in YAWS:
         assert (out(d1) / "thumbs" / f"{y}.png").read_bytes() == (
             out(d2) / "thumbs" / f"{y}.png"
         ).read_bytes()
+
+
+def test_missing_layer_render_placeholder(tmp_path):
+    d = tmp_path / "run"
+    make_run(d, drop_layer=(90, "bg"))
+    run_stage(d)
+    text = (out(d) / "index.html").read_text()
+    assert "bg missing" in text            # placeholder rendered
+    r = schema.read_validated(out(d) / "review.json", "review")
+    assert "center_yaw090_layer_bg.png" not in r["layers"]
+    assert len(r["layers"]) == len(YAWS) * len(LAYERS) - 1
+
+
+def test_no_layer_renders_all_placeholders(tmp_path):
+    d = tmp_path / "run"
+    make_run(d, with_layer_renders=False)
+    run_stage(d)
+    text = (out(d) / "index.html").read_text()
+    # 12 placeholders (4 yaws * 3 layers), page still self-contained
+    assert text.count("missing</div>") == len(YAWS) * len(LAYERS)
+    r = schema.read_validated(out(d) / "review.json", "review")
+    assert r["layers"] == []
 
 
 def test_accepted_side_by_side(tmp_path):
@@ -209,9 +350,11 @@ def test_accepted_side_by_side(tmp_path):
     assert r["compared_to_accepted"] is True
     text = (out(b) / "index.html").read_text()
     assert "accepted" in text
-    # 4 this-run images + 4 accepted images, no placeholders
-    assert text.count("data:image/png;base64,") == 8
     assert "no accepted baseline" not in text
+    # the 4 accepted thumbs are embedded alongside the 4 this-run thumbs
+    for y in YAWS:
+        png = (out(b) / "thumbs" / f"{y}.png").read_bytes()
+        assert base64.b64encode(png).decode("ascii") in text
 
 
 def test_accepted_incomplete_ignored(tmp_path):
@@ -235,7 +378,6 @@ def test_reuses_s7_renders_byte_identical(tmp_path):
     d = tmp_path / "run"
     make_run(d)
     rdir = d / "s7_gates" / "out" / "renders"
-    rdir.mkdir(parents=True)
     fills = {0: 40, 90: 90, 180: 160, 270: 220}
     for y in YAWS:
         arr = np.full((8, 8, 3), fills[y], np.uint8)
@@ -251,8 +393,11 @@ def test_reuses_s7_renders_byte_identical(tmp_path):
 
 def test_receipt(run_dir):
     rec = receipts.read_receipt(run_dir, "s8_review")
-    assert set(rec["inputs"]) == {"scene"} | {f"verdict_{g}" for g in GATES}
-    assert set(rec["outputs"]) == {"index", "review"} | {
+    assert set(rec["inputs"]) == (
+        {"scene", "scene_review_sog", "compress"}
+        | {f"verdict_{g}" for g in GATES}
+    )
+    assert set(rec["outputs"]) == {"index", "review", "viewer_sog"} | {
         f"thumb_{y}" for y in YAWS
     }
     assert rec["params_used"] == {
@@ -261,7 +406,9 @@ def test_receipt(run_dir):
     assert rec["weights"] == []
     assert rec["gates"] == []
     assert rec["notes"]["compared_to_accepted"] is False
-    assert rec["notes"]["sog_bytes"] == len(SOG_STUB)
+    assert rec["notes"]["viewer_profile"] == "review"
+    assert rec["notes"]["primary_profile"] == "quest"
+    assert rec["notes"]["sog_ssim"] is None
     for v in list(rec["inputs"].values()) + list(rec["outputs"].values()):
         assert not v["path"].startswith("/")
 
@@ -269,7 +416,7 @@ def test_receipt(run_dir):
 def test_missing_verdict_raises(tmp_path):
     d = tmp_path / "run"
     make_run(d)
-    (d / "s7_gates" / "out" / "verdicts" / "jitter.json").unlink()
+    (d / "s7_gates" / "out" / "verdicts" / "fidelity_at_origin.json").unlink()
     with pytest.raises(FileNotFoundError, match="verdict"):
         run_stage(d)
 
@@ -278,6 +425,14 @@ def test_missing_scene_raises(tmp_path):
     d = tmp_path / "run"
     make_run(d)
     (d / "s6_compress" / "out" / "scene.ply").unlink()
+    with pytest.raises(FileNotFoundError, match="s6 output"):
+        run_stage(d)
+
+
+def test_missing_review_sog_raises(tmp_path):
+    d = tmp_path / "run"
+    make_run(d)
+    (d / "s6_compress" / "out" / "scene_review.sog").unlink()
     with pytest.raises(FileNotFoundError, match="s6 output"):
         run_stage(d)
 

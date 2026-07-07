@@ -136,6 +136,213 @@ depth f32)`. Camera{pos(3), yaw, pitch}. EWA projection of 3D gaussians,
 stable depth sort (key: depth then index), front-to-back per-splat bbox
 compositing, 3σ cutoff, transmittance early-out. Deterministic float32.
 
+## v2 QUALITY PASS (Machu Picchu review fixes) — authoritative deltas
+
+This section overrides the pre-v2 stage descriptions where they conflict.
+Determinism, single-owner modules, schema-validated on-disk IO, and
+"gates record verdicts, never abort" all still hold. Every new number is a
+`params.yaml` key hashed into receipts. Backend-independent — the depth model
+is unchanged (DA-V2-Small).
+
+### metrics (scenic/metrics.py — shared, already written, DO NOT edit)
+
+- `ssim(a, b) -> float`, `ssim_map(a, b)` — deterministic SSIM; accepts uint8
+  or float01, any channel count (grayscales internally).
+- `solid_angle_fraction(mask_HxW_bool) -> float` — cos-lat-weighted sphere
+  coverage fraction of an equirect boolean mask.
+- `equirect_tile_views(tiles_lon, tiles_lat) -> [(name, yaw_deg, pitch_deg,
+  fov_deg)]` — deterministic perspective view grid for fidelity tiling.
+- `lpips_advisory_available() -> (bool, reason)` — False by default; LPIPS is
+  advisory-only, weights never in the enforced tree.
+
+### S2 depth (pipeline/s2_depth.py) — 8-face ring + global solve
+
+- Face layout replaces the 6-cube with `params.faces`: an 8-face horizon ring
+  (yaw = k*45deg for k in 0..7, pitch 0, fov `ring_fov_deg`=100) PLUS zenith
+  (pitch +90) and nadir (pitch -90) caps at `cap_fov_deg` = 10 faces total.
+  Larger overlaps than the cube. Define the face list internally in s2 (name,
+  yaw, pitch, fov); reuse geometry.face_project / render_perspective.
+- Per-face inference at `faces.max_infer_px` (tile the face into overlapping
+  sub-tiles and mosaic the disparity if a face render exceeds max_infer_px;
+  at 518 no tiling occurs — record actual infer_px per face in depth_meta).
+- Alignment: ONE global least-squares over ALL adjacent-face overlaps (ring
+  neighbors incl. the wrap pair 7-0, and every ring face vs both caps) in
+  log-depth, minimizing sum over overlap pixels of Huber_delta(
+  (a_i x_i + b_i) - (a_j x_j + b_j)) via fixed-iteration IRLS
+  (`s2.huber_iters`, `s2.huber_delta_log`). SKY pixels excluded from overlap
+  rows (per-face sky via the same heuristic as the fused sky mask, computed on
+  the face). Gauge fixed by a Tikhonov pull toward identity (`s2.affine_reg`)
+  AND a final renormalization so the MEDIAN of the fused relative depth is 1
+  (median gauge). Loop closure is automatic from including the cyclic ring
+  adjacency. Receipt/depth_meta: per-face (affine_a, affine_b, residual_log,
+  infer_px) for all 10 faces, `overlap_residual_log`, and
+  `max_interface_step_log` (max over overlap pixels of the aligned log-depth
+  difference, robust 99th percentile).
+- NEW GATE `interface_step` (emitted in s2's receipt, like s2b's gates).
+  **REVISED (integration): `max_interface_step_log` is the confidence-WEIGHTED
+  MEDIAN ring-ring content seam** (not a 99th-pct max). Per-face monocular
+  depth genuinely disagrees in the far field (each face independently guesses
+  distant/sky depth) — inherent to the backend and irrelevant to a shell-based
+  bubble — so the metric excludes the far/sky tail (top decile of aligned
+  depth) and reports a robust central seam. The gate ALSO requires
+  `depth_dynamic_range` (p99/p1 finite depth) >= 2.0, so the opposite failure
+  mode (a collapsed near-constant fusion, which has a LOW seam) is still
+  caught. pass iff weighted-median-seam <= `s2.interface_step_max_log` AND
+  range >= 2. Never aborts.
+- The global solve HARD-ANCHORS face 0 to identity (a0=1, b0=0). Without a hard
+  anchor the pairwise log-depth-difference objective has a trivial a_i=0
+  (constant-depth) minimiser that a weak Tikhonov cannot outweigh; it collapses
+  the whole depth map to a constant. Post-normalise, the anchor and a "median
+  gauge" are identical, so the anchor is the correct, collapse-proof choice.
+- depth_meta `faces` now has 6..12 entries (schema updated). Downstream
+  consumers are unchanged (they read equirect depth_rel.npy).
+
+### S3 layers (pipeline/s3_layers.py) — kill the flat blocks
+
+- Occlusion edge now requires BOTH the log-grad threshold AND a depth ratio:
+  `d_far/d_near > s3.edge_depth_ratio_min` (1.4). Compute per-edge-pixel
+  near/far from the dominant-diff neighbor (as today) and drop edges whose
+  ratio is below threshold BEFORE building the band.
+- Band width hard-capped: `band_px = min(ceil(analytic)+band_extra_px,
+  s3.band_px_max)`. Analytic value from (head_box t_max, d_near, d_far) as
+  today. Record the cap in band_derivation.
+- Visibility test: emit background ONLY where the foreground edge actually
+  occludes some head-box pose. For each edge pixel, the disocclusion is real
+  iff the near surface, viewed from at least one head-box extreme pose
+  (the 6 lateral/vertical extremes + squat from gates.head_box_poses via
+  params — reimplement the pose list locally in s3 to preserve single-owner),
+  shifts by >= 1 px against the far surface. Practical deterministic test:
+  angular parallax of the near point between center and the pose,
+  |t_perp| / d_near (rad), must exceed one pixel angular_pixel_size(H) for the
+  band to be emitted at that edge; restrict bg_region to edges passing this.
+- Clamp bg splat scale to fg-equivalent at same depth: record in layers.json a
+  `bg_scale_clamp` flag; the actual clamp is applied in S4 (see below), s3
+  just guarantees bg_depth is the metric far-side depth so S4 can size bg
+  splats like fg at that depth.
+- Receipt + layers.json: add `bg_solid_angle_frac` =
+  metrics.solid_angle_fraction(bg_region). 
+- NEW GATE `bg_solid_angle` (emitted in s3's receipt): pass iff
+  bg_solid_angle_frac <= `s3.bg_solid_angle_max_frac` (0.05). metrics
+  {bg_solid_angle_frac, edge_px_count, band_px}, thresholds {max_frac}.
+
+### S4 place (pipeline/s4_place.py) — shell-inward + density/scale
+
+- `scale_multiplier` default is now 0.85 (param already changed).
+- Shell-inward routing by METRIC depth d (fg_depth is metric):
+  * splats are placed for finite, non-sky pixels with `d <= shell_distance_m`
+    (50). **REVISED (integration, evidence-driven): near content (d <
+    min_content_distance) STAYS as fg splats at true depth**, it is NOT routed
+    to the shell. Routing near content to the shell made the hole gate read
+    "shell below skyline" as 100% holes and killed origin fidelity; keeping it
+    as real geometry fixes both, and its discomfort is still flagged honestly
+    by the min_content_distance + stereo gates off the depth map. Record
+    near_fg_px (near content kept as fg) + far_shell_px in splats_meta;
+    near_shell_px stays as a field, now always 0.
+  * pixels with d > shell_distance_m OR sky OR non-finite route to the TEXTURED
+    SHELL at shell_radius_m (200), full pano texture, normals facing camera.
+  * Feather the frontier: fg splats with d in
+    [shell_distance_m - feather_m, shell_distance_m] get opacity multiplied by
+    (shell_distance_m - d)/feather_m (ramp to 0 at the boundary); the shell
+    additionally covers every direction with d > (shell_distance_m -
+    feather_m) so a backdrop is always present behind a fading splat (no hard
+    seam).
+- Importance sampling weighted by local color variance: in ADDITION to the
+  edge>ground>base class strides, bias density toward textured regions. Deterministic:
+  compute local color variance v (max over channels of the variance in a
+  `s4.color_var_window_px` half-window box, on fg_rgb01) and a per-pixel boost
+  b = 1 + (color_var_boost-1) * clip(v / color_var_ref, 0, 1). Apply by
+  keeping a class-selected pixel iff `(hash(r,c) deterministic in [0,1)) <
+  b/color_var_boost` — i.e. flat areas (b~1) are decimated by up to
+  1/color_var_boost, textured areas (b~color_var_boost) are kept. Use a fixed
+  deterministic hash of (r,c) (e.g. from scenic.determinism.rng is NOT allowed
+  per-pixel; instead use a closed-form: frac(sin dot) is non-portable — use
+  `((r*73856093) ^ (c*19349663)) & 0xffffff) / 0x1000000` as the uniform).
+  Record the effective retained fraction in splats_meta.
+- bg splat scale clamp: size bg splats as fg-equivalent at their depth:
+  radius = d * angpix * stride * scale_mult (same formula as fg), NOT inflated
+  by the bg stride if that would exceed the fg-equivalent; clamp to the fg
+  radius at that depth.
+- splats_meta additions: near_shell_px, far_shell_px, feather_px,
+  color_var_retained_frac. counts_by_layer unchanged (fg/bg/shell).
+
+### S6 compress (pipeline/s6_compress.py) — two profiles
+
+- Two profiles from `params.s6.profiles`: `review` (target 1.5M, cap 2M, sog
+  unbounded) and `quest` (600k/1M/60MB). For each profile, run the existing
+  opacity-floor -> isolation-prune -> merge pipeline, and enforce the cap via
+  s4 stride re-run (unchanged mechanism; s4 natural density is tuned to the
+  review target so review uses multiplier ~1 and quest coarsens). Run the
+  profiles in FIXED order (review then quest) so s4's final on-disk state is
+  deterministic; leave s4 outputs as the last (quest) placement.
+- Outputs: `scene_review.ply/.sog(+std)`, `scene_quest.ply/.sog(+std)`, and
+  PRIMARY aliases `scene.ply/.sog(+std)` = a byte copy of the
+  `primary_profile` (quest) — s7 gates load scene.ply (the shipped asset).
+- compress.json NEW SHAPE (schema updated):
+  ```
+  {"sog_tool": "...", "primary_profile": "quest", "viewer_profile": "review",
+   "profiles": {"review": {in_count, after_opacity_floor,
+     after_isolation_prune, after_merge, final_count, stride_retries,
+     ply_bytes, sog_bytes, target, cap, sog_max_mb},
+     "quest": {...same...}}}
+  ```
+- s7 budgets reads `profiles.quest` (the ship budget); s8 reads
+  `profiles.review` for the viewer + `profiles.quest` for the header, and
+  loads scene_review.sog into the inline viewer.
+
+### S7 gates (pipeline/s7_gates.py, gates/) — forensics + fidelity
+
+- Layer forensics (`params.s7.layers`): render origin (center pose, the 4 yaw
+  ring) THREE extra times per yaw with only fg, only bg, only shell splats
+  (filter by layer), save to out/renders/ as
+  `center_yaw{NNN}_layer_{fg,bg,shell}.png`. In s7's receipt notes add
+  `layer_counts` {fg,bg,shell} and `layer_solid_angle` {fg,bg,shell} =
+  solid_angle_fraction of the equirect mask each layer's splats project to
+  from the origin (approx: mark the direction bins the splats occupy).
+- NEW GATE `fidelity_at_origin` (gates/fidelity.py): for each view from
+  metrics.equirect_tile_views(s7.fidelity.tiles_lon, tiles_lat) at
+  s7.fidelity.render_px, render the PRIMARY splats from the origin and sample
+  the SOURCE pano (s1 clean if present else s0 pano) into the same
+  perspective; SSIM per tile. Report worst tile + mean. PASS iff worst >=
+  ssim_worst_tile_min AND mean >= ssim_mean_min (SSIM enforced). LPIPS:
+  if lpips_advisory_available() compute + report as an advisory metric
+  `lpips_mean`; else metrics get `lpips: "advisory_unavailable"` and a reason
+  in details. LPIPS NEVER affects pass. gate name `fidelity_at_origin`.
+- gates/fidelity.py needs run_dir (like budgets) to find the source pano; wire
+  `fidelity.run_gate(splats, params, out, run_dir=run_dir)` in s7.
+- GATE_ORDER becomes ("hole","jitter","stereo","people","budgets",
+  "fidelity_at_origin"). budgets reads compress profiles.quest.
+
+### S8 review (pipeline/s8_review.py, docs/) — toggles + SOG quant
+
+- Layer toggle links: surface the s7 layer renders
+  (center_yaw*_layer_{fg,bg,shell}.png) on the page as a small gallery with
+  fg/bg/shell toggle (inline, base64, no network).
+- SOG quant check: origin render of `scene_review.ply` vs `scene_review.sog`
+  is not directly renderable (.sog is packed); instead render scene_review.ply
+  from origin (4 yaws) AND decode-and-render is out of scope — compare the
+  review PLY origin render vs the QUEST/primary PLY origin render is NOT the
+  ask. The ask: measure .ply-vs-.sog compression loss. Deterministic approach:
+  load scene_review.sog back via the same reader path splat-transform round-
+  trips (if a python .sog reader is unavailable, SKIP the pixel compare and
+  instead record the byte sizes + a note). MINIMUM viable + deterministic:
+  record ply_bytes vs sog_bytes ratio per profile from compress.json AND, if a
+  .sog->splat decode is available in-repo, SSIM(origin render ply, origin
+  render sog) into review.json.sog_ssim; else review.json.sog_ssim = null with
+  reason. Show the number (or "decode unavailable") on the page.
+- The inline viewer loads `scene_review.sog` (copy the review sog to the run's
+  s8 out and reference it; for the docs/ deploy the human copies it).
+- review.json additions: `layers` (the layer render filenames), `sog_ssim`
+  (float or null), `profiles` (echo compress profiles final_count + sog_bytes).
+
+### tools/sweep.py + `make sweep`
+
+- Grid over {s4.scale_multiplier, s4.base_stride, s3.edge_depth_ratio_min,
+  s3.band_px_max} on a fixture; for each cell write a temp params override,
+  run the pipeline (or a fast subset up to s7 fidelity), rank cells by
+  fidelity_at_origin mean SSIM (desc), tie-break worst-tile SSIM. Emit a
+  ranked table (stdout + runs/_sweep/report.json). Deterministic given the
+  grid. `make sweep FIXTURE=fixtures/ci_tiny.jpg`.
+
 ## Testing
 
 Every module gets `tests/test_<module>.py`. Oracles:

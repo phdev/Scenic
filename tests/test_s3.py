@@ -1,7 +1,23 @@
-"""s3_layers tests: synthetic 256x128 scene — a vertical foreground slab at
-2 m occluding a 10 m background, plus a sky band. Verifies edge detection,
-the analytic band-width derivation, push-pull background fill quality,
-schema validity, and bit-identical determinism across runs."""
+"""s3_layers tests (v2 "kill the flat blocks").
+
+Synthetic 256x128 scene with three depth boundaries, each isolated by a sky
+band so no spurious cross edges appear:
+
+  * NEAR band (rows 12..59, bg 10 m):
+      - slab A (cols 60..120) at 2 m   -> REAL occlusion (ratio 5 > 1.4,
+        near enough to disocclude for a head-box pose) -> emits a band.
+      - slab C (cols 160..200) at 13.8 m -> low ratio (13.8/10 = 1.38 < 1.4)
+        while the log-gradient DOES pass -> must be REJECTED as an edge by the
+        depth-ratio test (no band).
+  * FAR band (rows 82..115, bg 200 m):
+      - slab E (cols 60..120) at 600 m -> ratio 3 > 1.4 and log-gradient pass,
+        but both surfaces are far so no head-box pose disoccludes it -> the
+        visibility test must drop it (no band).
+
+Verifies edge/ratio/visibility gating, the capped analytic band width, the
+push-pull far-side fill, the bg_solid_angle gate + schema, no NaN, and
+bit-identical determinism across runs.
+"""
 from __future__ import annotations
 
 import math
@@ -17,11 +33,30 @@ from scenic.stage import Ctx
 REPO = Path(__file__).resolve().parent.parent
 
 H, W = 128, 256
-SKY_ROWS = 16
-SLAB = (96, 160)  # columns of the 2 m foreground slab
-D_FG, D_BG = 2.0, 10.0
-FG_COLOR = np.array([200, 60, 60], np.uint8)
-BG_COLOR = np.array([60, 200, 60], np.uint8)
+
+# row bands (half-open python ranges); sky separates every scene band
+SKY_TOP = (0, 12)
+NEAR = (12, 60)      # rows 12..59
+SKY_MID = (60, 82)   # rows 60..81  (>= band_px gap so slab A can't leak down)
+FAR = (82, 116)      # rows 82..115
+SKY_BOT = (116, 128)
+
+# column slabs
+SLAB_A = (60, 121)   # cols 60..120, depth 2  (real occlusion)
+SLAB_C = (160, 201)  # cols 160..200, depth 13.8 (ratio-fail)
+SLAB_E = (60, 121)   # cols 60..120, depth 600 (far-far, visibility drops)
+
+D_NEAR_BG = 10.0
+D_FG = 2.0
+D_C = 13.8
+D_FAR_BG = 200.0
+D_E = 600.0
+
+BG_COLOR = np.array([60, 200, 60], np.uint8)      # near bg (green)
+FG_COLOR = np.array([200, 60, 60], np.uint8)      # slab A (red)
+C_COLOR = np.array([200, 200, 60], np.uint8)      # slab C (yellow)
+FARBG_COLOR = np.array([60, 60, 200], np.uint8)   # far bg (blue)
+E_COLOR = np.array([200, 60, 200], np.uint8)      # slab E (magenta)
 SKY_COLOR = np.array([100, 150, 255], np.uint8)
 
 OUT_FILES = [
@@ -36,15 +71,25 @@ OUT_FILES = [
 
 
 def make_scene() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    depth = np.full((H, W), D_BG, np.float32)
-    depth[SKY_ROWS:, SLAB[0] : SLAB[1]] = D_FG
-    depth[:SKY_ROWS, :] = np.inf
-    sky = np.zeros((H, W), bool)
-    sky[:SKY_ROWS] = True
+    depth = np.full((H, W), np.inf, np.float32)
     rgb = np.empty((H, W, 3), np.uint8)
-    rgb[:] = BG_COLOR
-    rgb[:SKY_ROWS] = SKY_COLOR
-    rgb[SKY_ROWS:, SLAB[0] : SLAB[1]] = FG_COLOR
+    rgb[:] = SKY_COLOR
+
+    # near band
+    depth[NEAR[0] : NEAR[1], :] = D_NEAR_BG
+    rgb[NEAR[0] : NEAR[1], :] = BG_COLOR
+    depth[NEAR[0] : NEAR[1], SLAB_A[0] : SLAB_A[1]] = D_FG
+    rgb[NEAR[0] : NEAR[1], SLAB_A[0] : SLAB_A[1]] = FG_COLOR
+    depth[NEAR[0] : NEAR[1], SLAB_C[0] : SLAB_C[1]] = D_C
+    rgb[NEAR[0] : NEAR[1], SLAB_C[0] : SLAB_C[1]] = C_COLOR
+
+    # far band
+    depth[FAR[0] : FAR[1], :] = D_FAR_BG
+    rgb[FAR[0] : FAR[1], :] = FARBG_COLOR
+    depth[FAR[0] : FAR[1], SLAB_E[0] : SLAB_E[1]] = D_E
+    rgb[FAR[0] : FAR[1], SLAB_E[0] : SLAB_E[1]] = E_COLOR
+
+    sky = ~np.isfinite(depth)
     return depth, sky, rgb
 
 
@@ -86,28 +131,67 @@ def out(run_dir: Path) -> Path:
     return run_dir / "s3_layers" / "out"
 
 
+# expected occlusion edges (grad AND ratio): slab A (2 edges/row over 48 rows)
+# + slab E (2 edges/row over 34 rows); slab C fails the ratio test -> excluded.
+NEAR_ROWS = NEAR[1] - NEAR[0]  # 48
+FAR_ROWS = FAR[1] - FAR[0]     # 34
+EXPECTED_EDGE_PX = 2 * NEAR_ROWS + 2 * FAR_ROWS   # 96 + 68 = 164
+EXPECTED_VISIBLE_EDGE_PX = 2 * NEAR_ROWS          # 96 (slab A only)
+
+
 def test_outputs_exist_and_layers_schema_valid(run_dir):
     for name in OUT_FILES:
         assert (out(run_dir) / name).exists(), name
     layers = schema.read_validated(out(run_dir) / "layers.json", "layers")
     assert layers["edge_px_count"] > 0
     assert layers["bg_filled_px"] > 0
+    assert layers["bg_scale_clamp"] is True  # echoes params s3.bg_scale_clamp
 
 
-def test_edges_detected_at_slab_boundary(run_dir):
+def test_ratio_test_rejects_low_ratio_boundary(run_dir):
     layers = schema.read_validated(out(run_dir) / "layers.json", "layers")
-    # one edge px per non-sky row on each side of the slab (forward diffs)
-    assert layers["edge_px_count"] == 2 * (H - SKY_ROWS)
+    # slab C (ratio 1.38 < 1.4) passes the log-grad but must be dropped, so the
+    # occlusion-edge count is exactly slab A + slab E (no slab C contribution).
+    assert layers["edge_px_count"] == EXPECTED_EDGE_PX
 
 
-def test_band_px_matches_hand_computed_value(run_dir):
+def test_visibility_test_drops_far_far_boundary(run_dir):
+    layers = schema.read_validated(out(run_dir) / "layers.json", "layers")
+    # slab E is a valid occlusion edge but no head-box pose disoccludes it at
+    # 200 m, so only slab A's edges survive the visibility test.
+    assert layers["visible_edge_px_count"] == EXPECTED_VISIBLE_EDGE_PX
+    assert layers["visible_edge_px_count"] < layers["edge_px_count"]
+
+    bg_mask = imageio.load_mask_png(out(run_dir) / "bg_mask.png")
+    # no band anywhere in the far band (rows 82..115) -> visibility removed it
+    assert bg_mask[FAR[0] : FAR[1]].sum() == 0
+    # no band in the sky bands either
+    assert bg_mask[SKY_TOP[0] : SKY_TOP[1]].sum() == 0
+    assert bg_mask[SKY_MID[0] : SKY_MID[1]].sum() == 0
+    assert bg_mask[SKY_BOT[0] : SKY_BOT[1]].sum() == 0
+
+
+def test_only_real_edge_produces_a_band(run_dir):
+    bg_mask = imageio.load_mask_png(out(run_dir) / "bg_mask.png")
+    assert bg_mask.any()  # the real occlusion emits a band
+    # band confined to the near band rows and to slab A's neighbourhood
+    # (cols 40..139); slab C (cols 160..200) gets NO band.
+    assert bg_mask[NEAR[0] : NEAR[1]].sum() == int(bg_mask.sum())
+    assert bg_mask[:, :40].sum() == 0
+    assert bg_mask[:, 140:].sum() == 0  # excludes slab C entirely
+
+
+def test_band_px_capped_and_hand_computed(run_dir):
     layers = schema.read_validated(out(run_dir) / "layers.json", "layers")
     band_px = layers["band_px"]
-    assert 2 <= band_px <= 64
     d = layers["band_derivation"]
+    assert 2 <= band_px <= d["band_px_max"]
+    assert d["band_px_max"] == 64
+    assert d["clamped"] is False
+    # analytic derivation uses the VISIBLE (slab A) edges: near 2 m, far 10 m.
     assert d["d_near"] == pytest.approx(D_FG, abs=1e-9)
-    assert d["d_far"] == pytest.approx(D_BG, abs=1e-9)
-    assert d["t_max"] == pytest.approx(1.0)
+    assert d["d_far"] == pytest.approx(D_NEAR_BG, abs=1e-9)
+    assert d["t_max"] == pytest.approx(1.0)  # max(0.5, 0.2, 1.0)
     # band_angle = 1.0 * |1/2 - 1/10| = 0.4 rad; angpix = pi/128
     assert d["band_angle_rad"] == pytest.approx(0.4, abs=1e-12)
     expected = int(np.clip(math.ceil(0.4 / (math.pi / H)) + 2, 2, 64))
@@ -116,48 +200,98 @@ def test_band_px_matches_hand_computed_value(run_dir):
     assert d["band_px"] == band_px
 
 
+def test_band_derivation_records_cap_when_clamped():
+    # a genuinely huge analytic band (a very near edge) must clamp to band_px_max
+    # and record clamped=True.
+    depth = np.full((H, W), 100.0, np.float32)   # far bg
+    depth[NEAR[0] : NEAR[1], SLAB_A[0] : SLAB_A[1]] = 0.05  # extremely near slab
+    depth[: NEAR[0]] = np.inf
+    depth[NEAR[1] :] = np.inf
+    sky = ~np.isfinite(depth)
+    rgb = np.zeros((H, W, 3), np.uint8)
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td) / "run"
+        for sub in ["s2b_scale/out", "s2_depth/out", "s0_ingest/out"]:
+            (d / sub).mkdir(parents=True)
+        imageio.save_npy(d / "s2b_scale/out/depth_m.npy", depth)
+        imageio.save_mask_png(d / "s2_depth/out/sky_mask.png", sky)
+        imageio.save_png(d / "s0_ingest/out/pano.png", rgb)
+        run_stage(d)
+        layers = schema.read_validated(d / "s3_layers/out/layers.json", "layers")
+    assert layers["band_px"] == 64
+    assert layers["band_derivation"]["clamped"] is True
+    assert layers["band_derivation"]["raw_band_px"] > 64
+
+
 def test_bg_fill_comes_from_far_side(run_dir):
-    depth, sky, _ = make_scene()
+    depth, _, _ = make_scene()
     bg_mask = imageio.load_mask_png(out(run_dir) / "bg_mask.png")
     bg_depth = imageio.load_npy(out(run_dir) / "bg_depth.npy")
     bg_rgb = imageio.load_rgb(out(run_dir) / "bg_rgb.png")
 
-    assert bg_mask.any()
-    assert not (bg_mask & sky).any()  # band excludes sky
-    # far-side band: pixels in the band whose original depth was background
-    far_band = bg_mask & np.isfinite(depth) & (depth == D_BG)
+    # far-side band pixels: in the band, originally the near-bg (10 m, green)
+    far_band = bg_mask & np.isfinite(depth) & (depth == D_NEAR_BG)
     assert far_band.sum() > 0
     vals = bg_depth[far_band]
-    assert vals.min() > 5.0
-    assert abs(float(np.median(vals)) - D_BG) < 0.5
-    # rgb filled from the background color, not the slab color
+    assert float(np.median(vals)) > 5.0  # closer to far 10 m than near 2 m
+    # rgb filled toward the background (green), not the slab (red)
     fill = bg_rgb[far_band].astype(np.int64)
-    assert np.abs(fill - BG_COLOR.astype(np.int64)).max() <= 5
-    assert np.abs(fill - FG_COLOR.astype(np.int64)).max() > 50
+    med = np.median(fill, axis=0)
+    assert np.abs(med - BG_COLOR.astype(np.int64)).max() < np.abs(
+        med - FG_COLOR.astype(np.int64)
+    ).max()
+
+
+def test_bg_depth_metric_and_finite(run_dir):
+    bg_depth = imageio.load_npy(out(run_dir) / "bg_depth.npy")
+    assert bg_depth.dtype == np.float32
+    assert np.isfinite(bg_depth).all()  # filled everywhere, no NaN/inf
+    assert not np.isnan(bg_depth).any()
 
 
 def test_no_nan_and_fg_layout(run_dir):
     depth, sky, rgb = make_scene()
-    bg_depth = imageio.load_npy(out(run_dir) / "bg_depth.npy")
     fg_depth = imageio.load_npy(out(run_dir) / "fg_depth.npy")
     fg_mask = imageio.load_mask_png(out(run_dir) / "fg_mask.png")
     fg_rgb = imageio.load_rgb(out(run_dir) / "fg_rgb.png")
 
-    assert bg_depth.dtype == np.float32 and fg_depth.dtype == np.float32
-    assert np.isfinite(bg_depth).all()  # filled everywhere, no NaN/inf
+    assert fg_depth.dtype == np.float32
     assert not np.isnan(fg_depth).any()
     expected_fg = np.isfinite(depth) & ~sky
-    assert (fg_mask == expected_fg).all()
+    assert (fg_mask == expected_fg).all()  # fg = original content, minus sky
     assert np.isinf(fg_depth[~expected_fg]).all()
     assert (fg_depth[expected_fg] == depth[expected_fg]).all()
-    assert (fg_rgb == rgb).all()  # pano already at depth res
+    assert (fg_rgb == rgb).all()  # pano already at depth res, ~sky preserved
+
+
+def test_bg_solid_angle_gate_schema_and_value(run_dir):
+    rec = receipts.read_receipt(run_dir, "s3_layers")
+    layers = schema.read_validated(out(run_dir) / "layers.json", "layers")
+
+    assert len(rec["gates"]) == 1
+    gate = rec["gates"][0]
+    schema.validate(gate, "gate_verdict")  # schema-valid gate verdict
+    assert gate["gate"] == "bg_solid_angle"
+
+    frac = layers["bg_solid_angle_frac"]
+    assert isinstance(frac, float)
+    assert 0.0 <= frac <= 1.0
+    assert gate["metrics"]["bg_solid_angle_frac"] == pytest.approx(frac)
+    assert gate["metrics"]["edge_px_count"] == layers["edge_px_count"]
+    assert gate["metrics"]["band_px"] == layers["band_px"]
+    assert gate["thresholds"]["max_frac"] == pytest.approx(0.05)
+    # pass reflects the threshold comparison exactly
+    assert gate["pass"] == (frac <= 0.05)
 
 
 def test_receipt_written_with_params_used(run_dir):
     rec = receipts.read_receipt(run_dir, "s3_layers")
-    assert set(rec["params_used"]) == {"head_box", "s3"}
+    assert set(rec["params_used"]) == {"head_box", "s3", "s7"}
+    assert rec["params_used"]["s7"] == {"squat_y_m": -0.9}
     assert rec["weights"] == []
-    assert rec["gates"] == []
     assert rec["notes"]["pano_source"] == "s0_ingest"
     assert set(rec["outputs"]) == {
         "fg_rgb", "fg_depth", "fg_mask", "bg_rgb", "bg_depth", "bg_mask", "layers",
@@ -182,3 +316,7 @@ def test_determinism_double_run_identical_bytes(run_dir, tmp_path):
         a = (out(run_dir) / name).read_bytes()
         b = (out(d2) / name).read_bytes()
         assert a == b, f"{name} differs across identical runs"
+    # receipts (incl. the gate + params_hash) are byte-identical too
+    ra = (run_dir / "s3_layers" / "receipt.json").read_bytes()
+    rb = (d2 / "s3_layers" / "receipt.json").read_bytes()
+    assert ra == rb

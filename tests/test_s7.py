@@ -1,18 +1,21 @@
-"""s7_gates + gates/* tests.
+"""s7_gates + gates/* tests (v2 quality pass).
 
 Synthetic scenes built directly as SplatData (no upstream stages):
 
 - PASS scene: a closed lat-long sphere shell (r=10, mildly checkered gray)
   enclosing a ground disk at y=-1.6, with a LAYER_SHELL sphere at r=30
-  hidden behind the content. Every gate must pass.
+  hidden behind the content. All six gates pass (fidelity thresholds are
+  relaxed to -1 in tests since the synthetic pano is not the synthetic scene).
 - Wedge scenes: the same scene minus all content splats in a solid angle
-  below the horizon (lon 70..110 deg, pitch -35..-8 deg). With the shell
-  present the hole gate must fail via magenta; without it, via alpha —
-  falsifiability both ways.
+  below the horizon. With the shell present the hole gate must fail via
+  magenta; without it, via alpha — falsifiability both ways.
 - Near scene: PASS scene + one opaque splat 0.3 m ahead -> stereo near-limit
   fails.
-- Budgets: fake s6 dir (scene.ply + compress.json + scene.sog stub bytes);
-  pass at real params, fail under a monkeypatched cap / sog limit.
+- Budgets: fake s6 dir (scene.ply + two-profile compress.json + scene.sog
+  stub); pass at real params, fail under a monkeypatched cap / sog limit;
+  reads the QUEST profile.
+- Fidelity: a fake run dir with s0_ingest/out/pano.png; SSIM per tile,
+  advisory LPIPS unavailable, falsifiable via an impossible threshold.
 
 render_px is reduced via params override so CPU renders stay fast.
 """
@@ -24,9 +27,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from gates import GATE_ORDER, budgets, hole, jitter, stereo
+from gates import GATE_ORDER, LAYER_ITEMS, budgets, fidelity, hole, jitter, stereo
 from pipeline import s7_gates
-from scenic import determinism, params as params_mod, plyio, receipts, schema
+from scenic import determinism, imageio, params as params_mod, plyio, receipts, schema
 from scenic.stage import Ctx
 
 REPO = Path(__file__).resolve().parent.parent
@@ -98,7 +101,7 @@ def _cut_wedge(xyz: np.ndarray, shade: np.ndarray):
 
 def make_scene(
     wedge=False, shell=True, near_splat=False, nt=100, npi=50,
-    ground_spacing=0.35,
+    ground_spacing=0.35, fg=False,
 ) -> plyio.SplatData:
     sp, s_shade = _sphere_pts(10.0, nt, npi)
     gp, g_shade = _ground_pts(ground_spacing)
@@ -109,8 +112,8 @@ def make_scene(
     # the camera, and oversized splats there have grazing EWA footprints
     # that smear a false "blanket" over the lower image rows.
     parts = [
-        _splats(sp, np.stack([s_shade] * 3, axis=1), plyio.LAYER_BG,
-                scale=0.45),
+        _splats(sp, np.stack([s_shade] * 3, axis=1),
+                plyio.LAYER_FG if fg else plyio.LAYER_BG, scale=0.45),
         _splats(gp, np.stack([g_shade] * 3, axis=1), plyio.LAYER_BG,
                 scale=0.5 * ground_spacing),
     ]
@@ -129,9 +132,23 @@ def make_scene(
 # --------------------------------------------------------------- run helpers
 
 
-def stage_params(px: int = 96, **s7_over) -> dict:
+def stage_params(px: int = 96, fid_px: int = 48, fid_over: dict | None = None,
+                 **s7_over) -> dict:
     p = copy.deepcopy(params_mod.load(REPO / "params.yaml"))
     p["s7"]["render_px"] = px  # keep CPU renders fast in tests
+    # Small, always-pass fidelity by default: the synthetic pano is unrelated
+    # to the synthetic scene, so relax the SSIM floors to -1 (always true).
+    p["s7"]["fidelity"].update(
+        {
+            "tiles_lon": 4,
+            "tiles_lat": 2,
+            "render_px": fid_px,
+            "ssim_worst_tile_min": -1.0,
+            "ssim_mean_min": -1.0,
+        }
+    )
+    if fid_over:
+        p["s7"]["fidelity"].update(fid_over)
     p["s7"].update(s7_over)
     return p
 
@@ -146,23 +163,57 @@ def make_ctx() -> Ctx:
     )
 
 
+def _profile(n, final, sog_b, ply_bytes, target, cap, sog_max_mb):
+    return {
+        "in_count": n, "after_opacity_floor": n,
+        "after_isolation_prune": n, "after_merge": final,
+        "final_count": final, "stride_retries": [],
+        "ply_bytes": int(ply_bytes), "sog_bytes": int(sog_b),
+        "target": target, "cap": cap, "sog_max_mb": sog_max_mb,
+    }
+
+
 def make_s6_dir(run_dir: Path, scene: plyio.SplatData,
-                sog: bytes = SOG_STUB) -> None:
+                sog: bytes = SOG_STUB, *, quest_final: int | None = None,
+                quest_sog: int | None = None) -> None:
     out = run_dir / "s6_compress" / "out"
     out.mkdir(parents=True)
     plyio.write_splats(out / "scene.ply", scene)
     (out / "scene.sog").write_bytes(sog)
+    ply_bytes = (out / "scene.ply").stat().st_size
     n = len(scene)
-    schema.write_validated(
-        out / "compress.json",
-        {
-            "in_count": n, "after_opacity_floor": n,
-            "after_isolation_prune": n, "after_merge": n, "final_count": n,
-            "stride_retries": [], "sog_bytes": len(sog),
-            "sog_tool": "test-stub",
+    qf = n if quest_final is None else quest_final
+    qs = len(sog) if quest_sog is None else quest_sog
+    compress = {
+        "sog_tool": "test-stub",
+        "primary_profile": "quest",
+        "viewer_profile": "review",
+        "profiles": {
+            "review": _profile(n, n, len(sog) * 3, ply_bytes,
+                                1500000, 2000000, 0),
+            "quest": _profile(n, qf, qs, ply_bytes, 600000, 1000000, 60),
         },
-        "compress",
-    )
+    }
+    schema.write_validated(out / "compress.json", compress, "compress")
+
+
+def make_source_pano(run_dir: Path, kind: str = "ingest",
+                     w: int = 256, h: int = 128) -> Path:
+    """Deterministic equirect source pano (s0 ingest master, or s1 clean)."""
+    if kind == "ingest":
+        d = run_dir / "s0_ingest" / "out"
+        name = "pano.png"
+    else:
+        d = run_dir / "s1_cleanplate" / "out"
+        name = "pano_clean.png"
+    d.mkdir(parents=True, exist_ok=True)
+    j, i = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
+    checker = (((i * 8) // w + (j * 4) // h) % 2).astype(np.uint8)
+    r = (60 + 120 * checker).astype(np.uint8)
+    g = (i % 256).astype(np.uint8)
+    b = ((j * 2) % 256).astype(np.uint8)
+    imageio.save_png(d / name, np.stack([r, g, b], axis=-1))
+    return d / name
 
 
 @pytest.fixture(scope="module")
@@ -171,6 +222,7 @@ def stage_run(tmp_path_factory):
     d = tmp_path_factory.mktemp("s7run") / "run"
     scene = make_scene()
     make_s6_dir(d, scene)
+    make_source_pano(d)
     params = stage_params()
     determinism.set_seed(params.get("seed", 0))
     s7_gates.run(d, params, make_ctx())
@@ -189,6 +241,9 @@ def verdict(run_dir: Path, gate: str) -> dict:
 
 def test_stage_verdicts_exist_and_schema_valid(stage_run):
     d, _, _ = stage_run
+    assert GATE_ORDER == (
+        "hole", "jitter", "stereo", "people", "budgets", "fidelity_at_origin"
+    )
     for g in GATE_ORDER:
         v = verdict(d, g)  # read_validated => schema gate_verdict enforced
         assert v["gate"] == g
@@ -201,14 +256,17 @@ def test_stage_representative_renders(stage_run):
     for yaw in ("000", "090", "180", "270"):
         assert (rdir / f"center_yaw{yaw}_magenta.png").exists()
         assert (rdir / f"center_yaw{yaw}_normal.png").exists()
+        for layer in ("fg", "bg", "shell"):
+            assert (rdir / f"center_yaw{yaw}_layer_{layer}.png").exists()
     for extra in ("jitter_base.png", "jitter_offset.png",
                   "stereo_yaw000_left.png", "stereo_yaw000_right.png",
-                  "hole_worst_magenta.png"):
+                  "hole_worst_magenta.png", "fidelity_worst_render.png",
+                  "fidelity_worst_source.png"):
         assert (rdir / extra).exists()
 
 
 def test_stage_receipt(stage_run):
-    d, params, _ = stage_run
+    d, params, scene = stage_run
     rec = receipts.read_receipt(d, "s7_gates")
     assert [g["gate"] for g in rec["gates"]] == list(GATE_ORDER)
     for g in rec["gates"]:
@@ -227,6 +285,16 @@ def test_stage_receipt(stage_run):
         p.name for p in rdir.glob("*.png"))
     assert len(rec["notes"]["renders"]) > 0
     assert rec["notes"]["all_pass"] is True
+    # layer forensics notes
+    lc = rec["notes"]["layer_counts"]
+    la = rec["notes"]["layer_solid_angle"]
+    assert set(lc) == {"fg", "bg", "shell"} == set(la)
+    # this scene has no fg splats; bg + shell are populated
+    assert lc["fg"] == 0
+    assert lc["bg"] > 0 and lc["shell"] > 0
+    assert lc["bg"] + lc["shell"] == len(scene)
+    assert la["fg"] == 0.0
+    assert 0.0 < la["bg"] <= 1.0 and 0.0 < la["shell"] <= 1.0
     # receipt gates match the on-disk verdict files
     for g, emb in zip(GATE_ORDER, rec["gates"]):
         assert emb == verdict(d, g)
@@ -364,14 +432,21 @@ def test_budgets_passes(stage_run):
     v = verdict(d, "budgets")
     assert v["pass"] is True
     m = v["metrics"]
+    # budgets reads the QUEST profile's final_count / sog_bytes
     assert m["final_count"] == len(scene)
     assert m["sog_bytes"] == len(SOG_STUB)
+    assert m["scene_ply_count"] == len(scene)
+    assert m["scene_sog_bytes"] == len(SOG_STUB)
+    # review profile recorded, non-failing
+    assert m["review_final_count"] == len(scene)
+    assert m["review_sog_bytes"] == len(SOG_STUB) * 3
     assert m["count_vs_target_ratio"] == pytest.approx(
         len(scene) / params["splat_target"])
     assert v["thresholds"]["splat_cap"] == params["splat_cap"]
     assert v["thresholds"]["sog_max_bytes"] == params["sog_max_mb"] * 1024 * 1024
-    assert v["details"]["count_matches_compress"] is True
+    assert v["details"]["count_matches_scene"] is True
     assert v["details"]["sog_bytes_matches_compress"] is True
+    assert v["details"]["primary_profile"] == "quest"
 
 
 def test_budgets_default_run_dir_derivation(stage_run):
@@ -381,6 +456,23 @@ def test_budgets_default_run_dir_derivation(stage_run):
     splats = plyio.read_splats(d / "s6_compress" / "out" / "scene.ply")
     v = budgets.run_gate(splats, params, d / "s7_gates" / "out")
     assert v == verdict(d, "budgets")
+
+
+def test_budgets_reads_quest_not_review(tmp_path):
+    """The gate must key off the quest profile: a bloated quest count fails
+    even when the review count is fine."""
+    scene = make_scene(nt=24, npi=12, ground_spacing=1.0)
+    d = tmp_path / "run"
+    make_s6_dir(d, scene, quest_final=5_000_000)  # over the 1M cap
+    splats = plyio.read_splats(d / "s6_compress" / "out" / "scene.ply")
+    params = stage_params()
+    v = budgets.run_gate(splats, params, d / "s7_gates" / "out", run_dir=d)
+    schema.validate(v, "gate_verdict")
+    assert v["pass"] is False
+    assert v["metrics"]["final_count"] == 5_000_000
+    # the on-disk ship .ply is smaller -> cross-check flags the mismatch
+    assert v["metrics"]["scene_ply_count"] == len(scene)
+    assert v["details"]["count_matches_scene"] is False
 
 
 def test_budgets_cap_violation_fails(stage_run):
@@ -404,6 +496,145 @@ def test_budgets_sog_violation_fails(stage_run):
     assert v["metrics"]["sog_bytes"] > v["thresholds"]["sog_max_bytes"]
 
 
+# ---------------------------------------------------------------- fidelity
+
+
+def _fidelity_run_dir(tmp_path, kind="ingest", nt=24, npi=12):
+    """Fake run dir with a source pano; returns (run_dir, scene, out_dir)."""
+    d = tmp_path / "run"
+    scene = make_scene(nt=nt, npi=npi, ground_spacing=1.0)
+    make_source_pano(d, kind=kind)
+    out = d / "s7_gates" / "out"
+    out.mkdir(parents=True)
+    return d, scene, out
+
+
+def test_fidelity_reports_and_advisory_unavailable(tmp_path):
+    d, scene, out = _fidelity_run_dir(tmp_path)
+    params = stage_params(fid_px=48)
+    v = fidelity.run_gate(scene, params, out, run_dir=d)
+    schema.validate(v, "gate_verdict")
+    assert v["gate"] == "fidelity_at_origin"
+    m = v["metrics"]
+    assert "ssim_worst_tile" in m and "ssim_mean" in m
+    assert -1.0 <= m["ssim_worst_tile"] <= 1.0
+    assert -1.0 <= m["ssim_mean"] <= 1.0
+    assert m["ssim_worst_tile"] <= m["ssim_mean"] + 1e-9
+    assert m["n_tiles"] == 4 * 2
+    assert isinstance(m["worst_tile"], str) and m["worst_tile"]
+    # LPIPS advisory unavailable by default (weights never in enforced tree)
+    assert m["lpips"] == "advisory_unavailable"
+    assert "lpips_mean" not in m
+    assert v["details"]["lpips_reason"]
+    assert v["thresholds"] == {
+        "ssim_worst_tile_min": -1.0, "ssim_mean_min": -1.0
+    }
+    # relaxed thresholds -> pass; diagnostic tiles written
+    assert v["pass"] is True
+    assert (out / "renders" / "fidelity_worst_render.png").exists()
+    assert (out / "renders" / "fidelity_worst_source.png").exists()
+    assert len(v["details"]["per_tile"]) == 8
+
+
+def test_fidelity_falsifiable(tmp_path):
+    """SSIM is enforced: an impossible worst-tile floor (>1) must fail."""
+    d, scene, out = _fidelity_run_dir(tmp_path)
+    params = stage_params(fid_px=48, fid_over={"ssim_worst_tile_min": 1.5})
+    v = fidelity.run_gate(scene, params, out, run_dir=d)
+    assert v["pass"] is False
+    assert v["metrics"]["ssim_worst_tile"] < 1.5
+
+
+def test_fidelity_mean_floor_falsifiable(tmp_path):
+    """The mean floor is independently enforced."""
+    d, scene, out = _fidelity_run_dir(tmp_path)
+    params = stage_params(fid_px=48, fid_over={"ssim_mean_min": 1.5})
+    v = fidelity.run_gate(scene, params, out, run_dir=d)
+    assert v["pass"] is False
+    assert v["metrics"]["ssim_mean"] < 1.5
+
+
+def test_fidelity_deterministic(tmp_path):
+    d, scene, out = _fidelity_run_dir(tmp_path)
+    params = stage_params(fid_px=48)
+    a = fidelity.run_gate(scene, params, out, run_dir=d)
+    b = fidelity.run_gate(scene, params, out, run_dir=d)
+    assert a == b
+
+
+def test_fidelity_source_pano_priority(tmp_path):
+    """s1 clean plate wins over s0 ingest; missing both raises."""
+    d = tmp_path / "run"
+    with pytest.raises(FileNotFoundError):
+        fidelity._source_pano_path(d)
+    make_source_pano(d, kind="ingest")
+    assert fidelity._source_pano_path(d).name == "pano.png"
+    make_source_pano(d, kind="clean")
+    assert fidelity._source_pano_path(d).name == "pano_clean.png"
+
+
+def test_fidelity_uses_clean_plate_when_present(tmp_path):
+    """When only the clean plate exists the gate uses it (no s0 pano)."""
+    d = tmp_path / "run"
+    scene = make_scene(nt=24, npi=12, ground_spacing=1.0)
+    make_source_pano(d, kind="clean")
+    out = d / "s7_gates" / "out"
+    out.mkdir(parents=True)
+    params = stage_params(fid_px=48)
+    v = fidelity.run_gate(scene, params, out, run_dir=d)
+    schema.validate(v, "gate_verdict")
+    assert v["metrics"]["n_tiles"] == 8
+
+
+def test_fidelity_missing_pano_raises(tmp_path):
+    d = tmp_path / "run"
+    (d / "s6_compress" / "out").mkdir(parents=True)  # unrelated dir
+    out = d / "s7_gates" / "out"
+    out.mkdir(parents=True)
+    scene = make_scene(nt=12, npi=6, ground_spacing=1.0)
+    with pytest.raises(FileNotFoundError):
+        fidelity.run_gate(scene, stage_params(fid_px=32), out, run_dir=d)
+
+
+# ------------------------------------------------------------------ layers
+
+
+def test_layer_forensics_renders_and_counts(tmp_path):
+    """A scene with all three layers: every fg/bg/shell origin render is
+    emitted and the receipt counts partition the scene."""
+    d = tmp_path / "run"
+    # fg=True routes the sphere to LAYER_FG so every layer is populated
+    scene = make_scene(nt=24, npi=12, ground_spacing=1.0, fg=True)
+    make_s6_dir(d, scene)
+    make_source_pano(d)
+    params = stage_params(px=64)
+    determinism.set_seed(params.get("seed", 0))
+    s7_gates.run(d, params, make_ctx())
+    rdir = d / "s7_gates" / "out" / "renders"
+    for yaw in ("000", "090", "180", "270"):
+        for layer in ("fg", "bg", "shell"):
+            assert (rdir / f"center_yaw{yaw}_layer_{layer}.png").exists()
+    rec = receipts.read_receipt(d, "s7_gates")
+    lc = rec["notes"]["layer_counts"]
+    assert lc["fg"] > 0 and lc["bg"] > 0 and lc["shell"] > 0
+    assert lc["fg"] + lc["bg"] + lc["shell"] == len(scene)
+
+
+def test_layers_disabled_skips_forensics(tmp_path):
+    d = tmp_path / "run"
+    scene = make_scene(nt=24, npi=12, ground_spacing=1.0)
+    make_s6_dir(d, scene)
+    make_source_pano(d)
+    params = stage_params(px=64, layers=False)
+    determinism.set_seed(params.get("seed", 0))
+    s7_gates.run(d, params, make_ctx())
+    rdir = d / "s7_gates" / "out" / "renders"
+    assert not list(rdir.glob("*_layer_*.png"))
+    rec = receipts.read_receipt(d, "s7_gates")
+    assert rec["notes"]["layer_counts"] == {}
+    assert rec["notes"]["layer_solid_angle"] == {}
+
+
 # ------------------------------------------------------ stage error handling
 
 
@@ -424,6 +655,7 @@ def test_stage_double_run_byte_identical(tmp_path):
     dirs = [tmp_path / "run_a", tmp_path / "run_b"]
     for d in dirs:
         make_s6_dir(d, scene)
+        make_source_pano(d)
         determinism.set_seed(params.get("seed", 0))
         s7_gates.run(d, params, make_ctx())
 
@@ -436,6 +668,6 @@ def test_stage_double_run_byte_identical(tmp_path):
 
     fa, fb = files(dirs[0]), files(dirs[1])
     assert [p.name for p in fa] == [p.name for p in fb]
-    assert len(fa) >= 1 + 5 + 8
+    assert len(fa) >= 1 + 6 + 8
     for a, b in zip(fa, fb):
         assert a.read_bytes() == b.read_bytes(), f"{a.name} differs"

@@ -14,7 +14,7 @@
     "faces": {
       "type": "array",
       "minItems": 6,
-      "maxItems": 6,
+      "maxItems": 12,
       "items": {
         "type": "object",
         "required": ["name", "affine_a", "affine_b"],

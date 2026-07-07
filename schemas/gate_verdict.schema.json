@@ -5,7 +5,7 @@
   "required": ["gate", "pass", "metrics", "thresholds"],
   "additionalProperties": false,
   "properties": {
-    "gate": {"enum": ["hole", "jitter", "stereo", "people", "budgets", "cleanplate_detector", "cleanplate_containment", "min_content_distance", "ground_plane", "watermark", "license_sidecar"]},
+    "gate": {"enum": ["hole", "jitter", "stereo", "people", "budgets", "cleanplate_detector", "cleanplate_containment", "min_content_distance", "ground_plane", "watermark", "license_sidecar", "interface_step", "bg_solid_angle", "fidelity_at_origin"]},
     "pass": {"type": "boolean"},
     "metrics": {"type": "object", "additionalProperties": {"type": ["number", "integer", "boolean", "string", "array"]}},
     "thresholds": {"type": "object", "additionalProperties": {"type": ["number", "integer", "boolean", "string"]}},

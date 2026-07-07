@@ -1,21 +1,35 @@
 """s8_review: static self-contained review page (this run vs last accepted).
 
-Reads s6_compress outputs (scene.ply / scene.sog / compress.json) and the
-five s7_gates verdicts, obtains 4 standard views (center pose, yaw
-0/90/180/270, pitch 0, s7.render_fov_deg, s7.render_px) — reusing s7's
-render PNGs byte-for-byte when recognizable in s7_gates/out/renders/, else
-rendering scene.ply through scenic.rasterizer — and emits:
+v2 QUALITY PASS deltas (authoritative, see docs/CONTRACTS.md):
 
-  out/index.html        fully self-contained static page: header (run params
-                        hash, splat counts from compress.json, sog size),
-                        gate verdict table (five gates), side-by-side image
-                        grid (this run vs the accepted baseline or a
-                        placeholder), SuperSplat footer note. All images are
-                        base64 data URIs, CSS is inline; no network, no
-                        timestamps, no absolute paths (byte-identical across
-                        identical runs in different run dirs).
-  out/thumbs/<yaw>.png  the 4 view PNGs
-  out/review.json       {page, poses, compared_to_accepted} (schema review)
+- Reads the two-profile `compress.json` (`profiles.review` + `profiles.quest`).
+  The header surfaces the quest final_count/sog AND the review final_count/sog.
+- Reads ALL SIX s7 verdicts (budgets, fidelity_at_origin, hole, jitter,
+  people, stereo), sorted.
+- Layer toggle gallery: surfaces the s7 layer renders
+  `center_yaw{NNN}_layer_{fg,bg,shell}.png` as an inline base64 gallery with a
+  small JS fg/bg/shell toggle (no network). Missing renders -> placeholder.
+- Keeps the 4-view this-vs-accepted grid (reuses s7's `center_yaw{NNN}.png`
+  renders byte-for-byte when present, else renders scene.ply).
+- SOG quant: reports per-profile ply_bytes vs sog_bytes ratio from
+  compress.json. A python `.sog` decoder does not exist in-repo (splat-transform
+  is a node subprocess whose WebP round-trip is not determinism-guaranteed and
+  the harness must stay pure/deterministic), so the pixel-level .ply-vs-.sog
+  SSIM is skipped: `review.json.sog_ssim = null` with reason
+  `decode_unavailable`. The byte ratios + note are shown on the page. This is
+  explicitly acceptable per CONTRACTS.
+- Copies `scene_review.sog` (viewer_profile) into the s8 out dir and the page's
+  inline-viewer note references it. SuperSplat footer retained.
+
+Outputs:
+  out/index.html         fully self-contained static page (base64 PNGs, inline
+                         CSS + a tiny inline JS toggle; no network, no
+                         timestamps, no absolute paths -> byte-identical across
+                         identical runs in different run dirs).
+  out/thumbs/<yaw>.png   the 4 view PNGs.
+  out/scene_review.sog   byte copy of s6's viewer-profile sog.
+  out/review.json        {page, poses, compared_to_accepted, layers, sog_ssim,
+                         profiles} (schema review).
 
 'Last accepted' = <run_dir>/../_accepted (a sibling run dir promoted by
 external tooling). Comparison requires its s8_review/out/review.json plus all
@@ -39,14 +53,17 @@ from scenic.stage import Ctx
 
 STAGE = "s8_review"
 
-# the five ship gates, iterated in sorted order everywhere
-GATES = ("budgets", "hole", "jitter", "people", "stereo")
+# the six ship gates, iterated in sorted order everywhere
+GATES = ("budgets", "fidelity_at_origin", "hole", "jitter", "people", "stereo")
 
 # standard review views: center pose, four compass yaws (degrees), pitch 0
 YAWS_DEG = (0, 90, 180, 270)
 
+# layer forensics order (matches s7 render suffixes), fixed for determinism
+LAYERS = ("fg", "bg", "shell")
+
 SUPERSPLAT_NOTE = (
-    "scene.sog can be opened in SuperSplat (https://superspl.at) "
+    "scene_review.sog can be opened in SuperSplat (https://superspl.at) "
     "&mdash; drag the file into the editor."
 )
 
@@ -62,7 +79,23 @@ _CSS = [
     ".ph{width:256px;height:256px;display:flex;align-items:center;"
     "justify-content:center;border:1px dashed #555;color:#777}",
     "footer{margin-top:24px;color:#999}",
+    # layer toggle gallery
+    ".gal{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}",
+    ".gal .cell{border:1px solid #333;padding:6px;text-align:center}",
+    ".gal img{width:160px;height:160px}",
+    ".gal .ph{width:160px;height:160px}",
+    ".gal .layer{display:none}",
+    '#gallery[data-layer="fg"] .layer-fg{display:block}',
+    '#gallery[data-layer="bg"] .layer-bg{display:block}',
+    '#gallery[data-layer="shell"] .layer-shell{display:block}',
+    ".toggle button{font-family:monospace;background:#222;color:#ddd;"
+    "border:1px solid #555;padding:4px 12px;margin-right:6px;cursor:pointer}",
 ]
+
+_TOGGLE_JS = (
+    "function setLayer(l){"
+    "document.getElementById('gallery').setAttribute('data-layer',l);}"
+)
 
 
 # ------------------------------------------------------------------ helpers
@@ -86,6 +119,10 @@ def _find_s7_render(renders_dir: Path, yaw_deg: int) -> Path | None:
         if p.exists():
             return p
     return None
+
+
+def _layer_render_name(yaw_deg: int, layer: str) -> str:
+    return f"center_yaw{yaw_deg:03d}_layer_{layer}.png"
 
 
 def _load_accepted(run_dir: Path) -> tuple[dict[int, bytes], bool]:
@@ -123,16 +160,35 @@ def _data_uri(png_bytes: bytes) -> str:
     return "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
 
 
+def _ratio(ply_bytes: int, sog_bytes: int) -> float | None:
+    """ply/sog compression ratio; None if sog byte count is unusable."""
+    if sog_bytes <= 0:
+        return None
+    return ply_bytes / sog_bytes
+
+
+def _fmt_ratio(r: float | None) -> str:
+    return "n/a" if r is None else f"{r:.2f}x"
+
+
+# ------------------------------------------------------------------- HTML
+
+
 def _build_html(
     params_hash: str,
-    compress: dict,
-    sog_bytes: int,
+    profiles: dict,
+    primary_profile: str,
+    viewer_profile: str,
     verdicts: dict[str, dict],
     this_png: dict[int, bytes],
     accepted_png: dict[int, bytes],
     compared: bool,
     px: int,
     fov_deg: float,
+    layer_gallery: list[tuple[int, dict[str, str | None]]],
+    sog_ssim: float | None,
+    sog_ssim_reason: str,
+    viewer_sog_name: str,
 ) -> str:
     e = html.escape
     L: list[str] = []
@@ -149,12 +205,21 @@ def _build_html(
     L.append("<h1>Scenic review</h1>")
 
     # -- header ---------------------------------------------------------
-    sog_mb = sog_bytes / (1024.0 * 1024.0)
+    def _sog_mb(prof: str) -> float:
+        return int(profiles[prof]["sog_bytes"]) / (1024.0 * 1024.0)
+
+    quest_final = int(profiles["quest"]["final_count"])
+    review_final = int(profiles["review"]["final_count"])
+    quest_sog = int(profiles["quest"]["sog_bytes"])
+    review_sog = int(profiles["review"]["sog_bytes"])
     header_rows = [
         ("params hash", params_hash),
-        ("splats in", str(int(compress["in_count"]))),
-        ("splats final", str(int(compress["final_count"]))),
-        ("scene.sog size", f"{sog_bytes} bytes ({sog_mb:.2f} MB)"),
+        ("primary profile", primary_profile),
+        ("viewer profile", viewer_profile),
+        ("quest splats final", str(quest_final)),
+        ("quest sog size", f"{quest_sog} bytes ({_sog_mb('quest'):.2f} MB)"),
+        ("review splats final", str(review_final)),
+        ("review sog size", f"{review_sog} bytes ({_sog_mb('review'):.2f} MB)"),
         ("compared to accepted", "yes" if compared else "no"),
     ]
     L.append('<table class="kv">')
@@ -179,6 +244,61 @@ def _build_html(
         )
     L.append("</table>")
 
+    # -- SOG compression (ply vs sog bytes) -------------------------------
+    L.append("<h2>SOG compression (ply vs sog bytes)</h2>")
+    L.append("<table>")
+    L.append(
+        "<tr><th>profile</th><th>ply bytes</th><th>sog bytes</th>"
+        "<th>SOG byte ratio (ply/sog)</th></tr>"
+    )
+    for prof in sorted(profiles):
+        pb = int(profiles[prof]["ply_bytes"])
+        sb = int(profiles[prof]["sog_bytes"])
+        r = _fmt_ratio(_ratio(pb, sb))
+        L.append(
+            f"<tr><td>{e(prof)}</td><td>{pb}</td><td>{sb}</td>"
+            f"<td>{e(r)}</td></tr>"
+        )
+    L.append("</table>")
+    if sog_ssim is None:
+        L.append(
+            f"<p>sog SSIM (.ply vs .sog origin render): decode unavailable "
+            f"&mdash; {e(sog_ssim_reason)}. Byte ratios shown above.</p>"
+        )
+    else:
+        L.append(
+            f"<p>sog SSIM (.ply vs .sog origin render): {repr(sog_ssim)}.</p>"
+        )
+
+    # -- layer toggle gallery --------------------------------------------
+    L.append("<h2>Layer toggle (fg / bg / shell)</h2>")
+    L.append('<div class="toggle">')
+    for layer in LAYERS:
+        L.append(
+            f'<button type="button" data-layer="{layer}" '
+            f"onclick=\"setLayer('{layer}')\">{layer}</button>"
+        )
+    L.append("</div>")
+    L.append('<div class="gal" id="gallery" data-layer="fg">')
+    for yaw, uris in layer_gallery:
+        L.append('<div class="cell">')
+        L.append(f"<div>yaw {yaw}&deg;</div>")
+        for layer in LAYERS:
+            uri = uris.get(layer)
+            if uri is None:
+                L.append(
+                    f'<div class="layer layer-{layer} ph">'
+                    f"{layer} missing</div>"
+                )
+            else:
+                L.append(
+                    f'<img class="layer layer-{layer}" src="{uri}" '
+                    f'alt="yaw {yaw} {layer}">'
+                )
+        L.append("</div>")
+    L.append("</div>")
+    L.append(f"<script>{_TOGGLE_JS}</script>")
+
     # -- side-by-side view grid -------------------------------------------
     L.append("<h2>Views: this run vs accepted</h2>")
     L.append(f"<p>center pose, fov {fov_deg:g}&deg;, {px}x{px}px</p>")
@@ -201,6 +321,12 @@ def _build_html(
         )
     L.append("</table>")
 
+    # -- inline viewer note ----------------------------------------------
+    L.append(
+        f"<p>Inline viewer loads <code>{e(viewer_sog_name)}</code> "
+        f"(viewer_profile: {e(viewer_profile)}).</p>"
+    )
+
     L.append(f"<footer><p>{SUPERSPLAT_NOTE}</p></footer>")
     L.append("</body>")
     L.append("</html>")
@@ -218,18 +344,23 @@ def run(run_dir: Path, params: dict, ctx: Ctx) -> None:
     fov_deg = float(p7["render_fov_deg"])
     full_params_hash = hashing.sha256_json(params)
 
-    # -- s6 inputs ---------------------------------------------------------
+    # -- s6 inputs (two-profile) -------------------------------------------
     s6_out = run_dir / "s6_compress" / "out"
-    scene_ply = s6_out / "scene.ply"
-    scene_sog = s6_out / "scene.sog"
+    scene_ply = s6_out / "scene.ply"           # primary alias (quest) for 4-view
+    review_sog = s6_out / "scene_review.sog"   # viewer_profile sog
     compress_path = s6_out / "compress.json"
-    for pth in (scene_ply, scene_sog, compress_path):
+    for pth in (scene_ply, review_sog, compress_path):
         if not pth.exists():
             raise FileNotFoundError(f"missing s6 output {pth}")
     compress = schema.read_validated(compress_path, "compress")
-    sog_bytes = int(scene_sog.stat().st_size)
+    profiles = compress["profiles"]
+    for prof in ("review", "quest"):
+        if prof not in profiles:
+            raise KeyError(f"compress.json profiles missing {prof!r}")
+    primary_profile = str(compress["primary_profile"])
+    viewer_profile = str(compress["viewer_profile"])
 
-    # -- s7 verdicts (all five, schema-validated) ---------------------------
+    # -- s7 verdicts (all six, schema-validated) ---------------------------
     vdir = run_dir / "s7_gates" / "out" / "verdicts"
     verdicts: dict[str, dict] = {}
     for g in GATES:
@@ -241,10 +372,11 @@ def run(run_dir: Path, params: dict, ctx: Ctx) -> None:
             raise ValueError(f"{vpath} declares gate {v['gate']!r}, expected {g!r}")
         verdicts[g] = v
 
+    renders_dir = run_dir / "s7_gates" / "out" / "renders"
+
     # -- 4 standard views: reuse s7 renders byte-for-byte, else render ------
     thumbs_dir = out / "thumbs"
     thumbs_dir.mkdir(parents=True, exist_ok=True)
-    renders_dir = run_dir / "s7_gates" / "out" / "renders"
     splats = None  # lazy: only read the ply if we actually render
     this_png: dict[int, bytes] = {}
     poses: list[dict] = []
@@ -283,6 +415,35 @@ def run(run_dir: Path, params: dict, ctx: Ctx) -> None:
             }
         )
 
+    # -- layer toggle gallery (surface s7 layer renders; placeholder if not) -
+    layer_gallery: list[tuple[int, dict[str, str | None]]] = []
+    layer_filenames: list[str] = []
+    for yaw in YAWS_DEG:
+        uris: dict[str, str | None] = {}
+        for layer in LAYERS:
+            fname = _layer_render_name(yaw, layer)
+            lpath = renders_dir / fname
+            if lpath.exists():
+                uris[layer] = _data_uri(lpath.read_bytes())
+                layer_filenames.append(fname)
+            else:
+                uris[layer] = None
+        layer_gallery.append((yaw, uris))
+    layer_filenames = sorted(layer_filenames)
+
+    # -- SOG quant: byte ratios come from compress.json; pixel SSIM skipped --
+    # No in-repo python .sog decoder; splat-transform (node) round-trip is not
+    # determinism-guaranteed, so sog_ssim = null with an explicit reason.
+    sog_ssim: float | None = None
+    sog_ssim_reason = (
+        "no in-repo python .sog decoder (deterministic round-trip unavailable)"
+    )
+
+    # -- copy the viewer-profile sog into the s8 out dir --------------------
+    viewer_sog_name = "scene_review.sog"
+    out_sog = out / viewer_sog_name
+    out_sog.write_bytes(review_sog.read_bytes())
+
     # -- last accepted baseline ---------------------------------------------
     accepted_png, compared = _load_accepted(run_dir)
 
@@ -290,8 +451,20 @@ def run(run_dir: Path, params: dict, ctx: Ctx) -> None:
     index_path = out / "index.html"
     index_path.write_text(
         _build_html(
-            full_params_hash, compress, sog_bytes, verdicts,
-            this_png, accepted_png, compared, px, fov_deg,
+            full_params_hash,
+            profiles,
+            primary_profile,
+            viewer_profile,
+            verdicts,
+            this_png,
+            accepted_png,
+            compared,
+            px,
+            fov_deg,
+            layer_gallery,
+            sog_ssim,
+            sog_ssim_reason,
+            viewer_sog_name,
         )
     )
 
@@ -299,14 +472,32 @@ def run(run_dir: Path, params: dict, ctx: Ctx) -> None:
         "page": "index.html",
         "poses": poses,
         "compared_to_accepted": compared,
+        "layers": layer_filenames,
+        "sog_ssim": sog_ssim,
+        "sog_ssim_reason": None if sog_ssim is not None else sog_ssim_reason,
+        "profiles": {
+            prof: {
+                "final_count": int(profiles[prof]["final_count"]),
+                "sog_bytes": int(profiles[prof]["sog_bytes"]),
+            }
+            for prof in sorted(profiles)
+        },
     }
     review_path = out / "review.json"
     schema.write_validated(review_path, review, "review")
 
-    inputs: dict[str, Path] = {"scene": scene_ply}
+    inputs: dict[str, Path] = {
+        "scene": scene_ply,
+        "scene_review_sog": review_sog,
+        "compress": compress_path,
+    }
     for g in GATES:
         inputs[f"verdict_{g}"] = vdir / f"{g}.json"
-    outputs: dict[str, Path] = {"index": index_path, "review": review_path}
+    outputs: dict[str, Path] = {
+        "index": index_path,
+        "review": review_path,
+        "viewer_sog": out_sog,
+    }
     for yaw in YAWS_DEG:
         outputs[f"thumb_{yaw}"] = thumbs_dir / f"{yaw}.png"
 
@@ -320,7 +511,18 @@ def run(run_dir: Path, params: dict, ctx: Ctx) -> None:
         notes={
             "compared_to_accepted": compared,
             "render_sources": {str(p["yaw_deg"]): p["source"] for p in poses},
-            "sog_bytes": sog_bytes,
+            "primary_profile": primary_profile,
+            "viewer_profile": viewer_profile,
+            "sog_ssim": sog_ssim,
+            "layer_render_count": len(layer_filenames),
+            "profiles": {
+                prof: {
+                    "final_count": int(profiles[prof]["final_count"]),
+                    "sog_bytes": int(profiles[prof]["sog_bytes"]),
+                    "ply_bytes": int(profiles[prof]["ply_bytes"]),
+                }
+                for prof in sorted(profiles)
+            },
             "full_params_hash": full_params_hash,
         },
     )

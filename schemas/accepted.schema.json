@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "accepted baseline record",
+  "type": "object",
+  "required": ["schema", "source_run", "manifest_hash", "shippable", "gate_summary"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "scenic-accepted-v1"},
+    "source_run": {"type": "string", "pattern": "^[^/]+$", "not": {"pattern": "^_accepted"}},
+    "manifest_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "shippable": {"type": "boolean"},
+    "gate_summary": {
+      "type": "object",
+      "required": ["total", "passed", "all_pass"],
+      "additionalProperties": false,
+      "properties": {
+        "total": {"type": "integer", "minimum": 0},
+        "passed": {"type": "integer", "minimum": 0},
+        "all_pass": {"type": "boolean"}
+      }
+    }
+  }
+}

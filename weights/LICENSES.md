@@ -28,3 +28,27 @@ here.
 - License URL: https://huggingface.co/PekingU/rtdetr_r18vd/blob/main/README.md
 - Verified: 2026-07-05 via HF API card data at fetch time.
 - Files + sha256: see `pins.json` key `rtdetr_r18`.
+
+## OPEN / ADVISORY-ONLY (non-shipping, NOT enforced weights)
+
+These are NOT under `weights/`, NOT pinned in `pins.json`, and NOT downloaded
+at pipeline runtime. They exist only as advisory metrics whose license is
+unresolved. The license guard and the no-network guard stay green precisely
+because none of these are provisioned into the enforced tree.
+
+### LPIPS (VGG/ImageNet backbone) — OPEN, ADVISORY
+
+- Metric: LPIPS perceptual distance, used only as an ADVISORY reading in the
+  `fidelity_at_origin` gate. SSIM is the ENFORCED fidelity metric.
+- License status: **OPEN.** LPIPS ships a VGG-16 backbone pretrained on
+  ImageNet. The LPIPS code (richzhang/PerceptualSimilarity) is BSD-2-Clause,
+  but the ImageNet-pretrained VGG weights have unresolved commercial-use
+  provenance (ImageNet terms are research-oriented; torchvision weights carry
+  no explicit commercial grant). Pending counsel.
+- Handling until resolved: weights are NEVER placed in `weights/`. A human may
+  set `SCENIC_LPIPS_DIR` to a local weight dir OUTSIDE `weights/` and install
+  the optional `lpips` package to compute the advisory number locally; absent
+  that (the default, incl. CI), the gate emits `lpips: advisory_unavailable`
+  and enforces SSIM only.
+- Action: resolve VGG/ImageNet weight commercial licensing with counsel before
+  LPIPS is ever enforced or its weights committed.

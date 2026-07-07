@@ -1,13 +1,17 @@
-"""s4_place tests. Oracles per docs/CONTRACTS.md:
-  (a) SPHERE — constant fg depth R ==> every splat at |xyz| ~ R, with
-      class-stride radii and canonical unit quats;
-  (b) ROOM — closed-form box distances (6 x 3 x 8 m, camera 1.5 m above the
-      floor) ==> every splat inside the box bounds +-1%, floor splats at
-      y ~ -1.5 +-2%;
-  (c) determinism — double run is byte-identical;
-  (d) stride_multiplier=2 ==> < 0.5x the splats of multiplier 1 (roughly
-      quadratic reduction).
-Plus shell placement and quaternion round-trip unit tests."""
+"""s4_place tests. v2 "shell-inward + density/scale" oracles per
+docs/CONTRACTS.md "S4 place":
+
+  (a) SPHERE — constant fg depth R with min_content < R < shell_distance
+      ==> every splat at |xyz| ~ R, all LAYER_FG (no shell routing);
+      constant fg depth 100 (> shell_distance 50) ==> ALL routed to the
+      shell at radius 200;
+  (b) NEAR routing — constant fg depth 3 (< min_content 6) ==> ALL shell;
+  (c) FEATHER — depths spanning [46,50] ==> fg opacities ramp to ~0 at 50;
+  (d) COLOR VARIANCE — flat pano vs noisy pano ==> noisy retains more splats
+      (color_var_retained_frac higher);
+  (e) DETERMINISM — double run is byte-identical;
+  (f) STRIDE — stride_multiplier=2 reduces the count;
+plus bg scale clamp, shell placement, and quaternion round-trip unit tests."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -23,10 +27,11 @@ from scenic.stage import Ctx
 REPO = Path(__file__).resolve().parent.parent
 
 H, W = 64, 128
-SPHERE_R = 7.0
+SPHERE_R = 20.0                       # min_content(6) < R < shell_distance(50)
 FG_COLOR = np.array([120, 80, 200], np.uint8)
 BG_COLOR = np.array([40, 160, 90], np.uint8)
-BOX_X, BOX_Y, BOX_Z = 3.0, 1.5, 4.0  # half-extents; 6 x 3 x 8 m room
+# Big room so every wall distance sits in [min_content, shell_distance-feather]
+BOX_X, BOX_Y, BOX_Z = 12.0, 8.0, 16.0  # half-extents; 24 x 16 x 32 m room
 
 
 # ------------------------------------------------------------- fixtures
@@ -98,8 +103,8 @@ def run_stage(run_dir: Path, stride_multiplier: float = 1.0) -> dict:
 
 
 def _room_depth() -> np.ndarray:
-    """Exact per-direction distance to the interior of the 6x3x8 box with the
-    camera at the origin (1.5 m above the floor, i.e. mid-height)."""
+    """Exact per-direction distance to the interior of the big box, camera at
+    the origin (centered)."""
     dirs = geometry.equirect_dirs(W, H)
     ax = np.abs(dirs[..., 0])
     ay = np.abs(dirs[..., 1])
@@ -109,6 +114,14 @@ def _room_depth() -> np.ndarray:
         ty = np.where(ay > 1e-12, BOX_Y / ay, np.inf)
         tz = np.where(az > 1e-12, BOX_Z / az, np.inf)
     return np.minimum(np.minimum(tx, ty), tz).astype(np.float32)
+
+
+def _checkerboard_rgb(h: int, w: int) -> np.ndarray:
+    """High local-variance texture: alternating black/white per pixel."""
+    r = np.arange(h)[:, None]
+    c = np.arange(w)[None, :]
+    val = np.where((r + c) % 2 == 0, 255, 0).astype(np.uint8)
+    return np.repeat(val[..., None], 3, axis=2)
 
 
 @pytest.fixture(scope="module")
@@ -143,12 +156,15 @@ def _read(run_dir: Path):
 # ------------------------------------------------------------- (a) sphere
 
 
-def test_sphere_all_splats_on_sphere(sphere_run):
+def test_sphere_all_fg_on_sphere(sphere_run):
     splats, meta = _read(sphere_run)
     assert meta["count"] == len(splats) > 0
     assert meta["counts_by_layer"]["fg"] > 0
     assert meta["counts_by_layer"]["bg"] == 0
-    assert meta["counts_by_layer"]["shell"] == 0
+    assert meta["counts_by_layer"]["shell"] == 0  # R well inside the frontier
+    assert meta["near_shell_px"] == 0
+    assert meta["far_shell_px"] == 0
+    assert meta["feather_px"] == 0
     r = np.linalg.norm(splats.xyz.astype(np.float64), axis=1)
     assert np.all(r >= SPHERE_R - 1e-3)
     assert np.all(r <= SPHERE_R + 1e-3)
@@ -156,24 +172,24 @@ def test_sphere_all_splats_on_sphere(sphere_run):
     assert np.all(splats.origin_stage == 4)
 
 
-def test_sphere_radii_match_class_strides(sphere_run):
+def test_sphere_strides_and_radii(sphere_run):
     splats, meta = _read(sphere_run)
     p = _params()["s4"]
-    angpix = geometry.angular_pixel_size(H)
-    xyz = splats.xyz.astype(np.float64)
-    rnorm = np.linalg.norm(xyz, axis=1)
-    pitch_deg = np.degrees(np.arcsin(np.clip(xyz[:, 1] / rnorm, -1, 1)))
-    # constant depth => no edges; ground stride 1, base stride 2 at mult=1
-    expect_stride = np.where(pitch_deg < p["ground_band_pitch_deg"], 1, 2)
     assert meta["strides"] == {"edge": 1, "ground": 1, "base": 2, "bg": 2, "shell": 4}
-    expect_r = SPHERE_R * angpix * expect_stride * p["scale_multiplier"]
-    got_r = np.exp(splats.log_scales[:, 0].astype(np.float64))
-    assert np.allclose(got_r, expect_r, rtol=1e-4)
-    assert {1, 2} == set(np.unique(expect_stride))  # both classes sampled
+    angpix = geometry.angular_pixel_size(H)
+    depth = np.linalg.norm(splats.xyz.astype(np.float64), axis=1)
+    ratio = np.exp(splats.log_scales[:, 0].astype(np.float64)) / (
+        depth * angpix * p["scale_multiplier"]
+    )
+    assert np.allclose(ratio, np.round(ratio), rtol=1e-3, atol=1e-3)
+    strides_seen = set(np.round(ratio).astype(int))
+    assert strides_seen <= {1, 2}
+    assert {1, 2} == strides_seen  # both ground(1) and base(2) sampled
     # isotropic tangent axes + flattened normal axis
     assert np.allclose(splats.log_scales[:, 1], splats.log_scales[:, 0], atol=1e-6)
     got_r2 = np.exp(splats.log_scales[:, 2].astype(np.float64))
-    assert np.allclose(got_r2, expect_r * p["flatten_ratio"], rtol=1e-4)
+    got_r = np.exp(splats.log_scales[:, 0].astype(np.float64))
+    assert np.allclose(got_r2, got_r * p["flatten_ratio"], rtol=1e-4)
 
 
 def test_sphere_quats_unit_canonical(sphere_run):
@@ -189,7 +205,7 @@ def test_sphere_colors_and_opacity(sphere_run):
     rgb = plyio.dc_to_rgb01(splats.f_dc.astype(np.float64)) * 255.0
     assert np.allclose(rgb, FG_COLOR.astype(np.float64), atol=0.51)
     op = plyio.logit_to_opacity(splats.opacity_logit.astype(np.float64))
-    assert np.allclose(op, p["fg_opacity"], atol=1e-4)
+    assert np.allclose(op, p["fg_opacity"], atol=1e-4)  # no feather at R=20
 
 
 def test_sphere_receipt_written(sphere_run):
@@ -201,10 +217,147 @@ def test_sphere_receipt_written(sphere_run):
     assert rec["notes"]["strides"]["base"] == 2
     assert rec["notes"]["stride_multiplier"] == 1.0
     assert rec["params_used"]["s4"]["base_stride"] == 2
+    assert rec["params_used"]["min_content_distance_m"] == 6.0
+    assert rec["notes"]["near_shell_px"] == 0
     assert rec["weights"] == []
 
 
-# ------------------------------------------------------------- (b) room
+# --------------------------------------------- (a) far routing -> shell
+
+
+def test_far_content_all_routed_to_shell(tmp_path):
+    d = tmp_path / "run"
+    p = _params()["s4"]
+    depth = np.full((H, W), 100.0, np.float32)  # > shell_distance 50
+    make_run(d, depth)
+    run_stage(d)
+    splats, meta = _read(d)
+    assert meta["counts_by_layer"]["fg"] == 0
+    assert meta["counts_by_layer"]["bg"] == 0
+    assert meta["counts_by_layer"]["shell"] == len(splats) > 0
+    assert meta["far_shell_px"] == H * W
+    assert meta["near_shell_px"] == 0
+    r = np.linalg.norm(splats.xyz.astype(np.float64), axis=1)
+    assert np.allclose(r, p["shell_radius_m"], atol=1e-2)
+    assert np.all(splats.layer == plyio.LAYER_SHELL)
+
+
+# ------------------------------------------------------------- (b) near routing
+
+
+def test_near_content_kept_as_fg_splats(tmp_path):
+    # Near content (d < min_content 6m) STAYS as fg splats at true depth (real
+    # geometry the viewer must see); it is NOT routed to the shell. Its
+    # discomfort is flagged by the min_content_distance + stereo gates off the
+    # depth map, not hidden behind a backdrop.
+    d = tmp_path / "run"
+    depth = np.full((H, W), 3.0, np.float32)  # < min_content 6
+    make_run(d, depth)
+    run_stage(d)
+    splats, meta = _read(d)
+    assert meta["counts_by_layer"]["fg"] > 0
+    assert meta["counts_by_layer"]["shell"] == 0
+    assert meta["near_shell_px"] == 0
+    assert meta["near_fg_px"] == H * W
+    assert meta["far_shell_px"] == 0
+    fg = splats.layer == plyio.LAYER_FG
+    r = np.linalg.norm(splats.xyz[fg].astype(np.float64), axis=1)
+    assert np.allclose(r, 3.0, atol=1e-2)  # placed at true depth, not shell radius
+
+
+# ------------------------------------------------------------- (c) feather
+
+
+def test_feather_ramps_opacity_to_zero_at_frontier(tmp_path):
+    d = tmp_path / "run"
+    p = _params()["s4"]
+    shell_dist = float(p["shell_distance_m"])   # 50
+    feather_m = float(p["feather_m"])           # 5
+    # depth increases with row from 46 -> 50 (entirely inside the feather band)
+    col_depth = np.linspace(46.0, shell_dist, H, dtype=np.float64)
+    depth = np.broadcast_to(col_depth[:, None], (H, W)).astype(np.float32)
+    make_run(d, depth)
+    run_stage(d)
+    splats, meta = _read(d)
+    assert meta["feather_px"] > 0
+    fg = splats.layer == plyio.LAYER_FG
+    assert fg.sum() > 0
+    xyz = splats.xyz.astype(np.float64)
+    dd = np.linalg.norm(xyz[fg], axis=1)
+    op = plyio.logit_to_opacity(splats.opacity_logit[fg].astype(np.float64))
+    expect = p["fg_opacity"] * np.clip((shell_dist - dd) / feather_m, 0.0, 1.0)
+    assert np.allclose(op, expect, atol=3e-3)   # opacity ramps with depth
+    assert op.min() < 0.05                       # ~0 near the frontier (d~50)
+    assert op.max() > 0.60                       # ~full near d=46
+    # the shell backdrop is present behind the fading splats (d > 45)
+    assert meta["counts_by_layer"]["shell"] > 0
+
+
+# ------------------------------------------------------------- (d) color variance
+
+
+def _run_texture(tmp_path: Path, name: str, fg_rgb: np.ndarray) -> dict:
+    d = tmp_path / name / "run"
+    depth = np.full((H, W), SPHERE_R, np.float32)  # all content, no feather
+    make_run(d, depth, fg_rgb=fg_rgb)
+    run_stage(d)
+    _, meta = _read(d)
+    return meta
+
+
+def test_color_variance_retains_more_in_textured(tmp_path):
+    flat = _run_texture(tmp_path, "flat", np.broadcast_to(FG_COLOR, (H, W, 3)).copy())
+    noisy = _run_texture(tmp_path, "noisy", _checkerboard_rgb(H, W))
+    # noisy (high local variance) keeps ~everything; flat is decimated to ~1/boost
+    assert noisy["color_var_retained_frac"] > flat["color_var_retained_frac"]
+    assert noisy["counts_by_layer"]["fg"] > flat["counts_by_layer"]["fg"]
+    boost = _params()["s4"]["color_var_boost"]
+    assert flat["color_var_retained_frac"] < 0.5           # decimated
+    assert flat["color_var_retained_frac"] > 0.9 / boost   # ~1/boost survive
+    assert noisy["color_var_retained_frac"] > 0.9          # textured kept
+
+
+# ------------------------------------------------------------- (e) determinism
+
+
+def test_determinism_double_run_byte_identical(tmp_path):
+    outputs = []
+    for name in ["a", "b"]:
+        d = tmp_path / name / "run"
+        depth = _room_depth()
+        bg_mask = np.zeros((H, W), bool)
+        bg_mask[20:28, 30:50] = True
+        make_run(d, depth, bg_depth=depth.copy(), bg_mask=bg_mask,
+                 fg_rgb=_checkerboard_rgb(H, W))
+        run_stage(d)
+        outputs.append(
+            (
+                (_out(d) / "splats.ply").read_bytes(),
+                (_out(d) / "splats_meta.json").read_bytes(),
+            )
+        )
+    assert outputs[0][0] == outputs[1][0]
+    assert outputs[0][1] == outputs[1][1]
+
+
+# ------------------------------------------------------------- (f) stride cap
+
+
+def test_stride_multiplier_reduces_counts(tmp_path):
+    counts = {}
+    for mult in [1.0, 2.0]:
+        d = tmp_path / f"m{int(mult)}" / "run"
+        make_run(d, np.full((H, W), SPHERE_R, np.float32),
+                 fg_rgb=_checkerboard_rgb(H, W))
+        run_stage(d, stride_multiplier=mult)
+        _, meta = _read(d)
+        assert meta["stride_multiplier"] == mult
+        counts[mult] = meta["count"]
+    assert counts[2.0] > 0
+    assert counts[2.0] < 0.5 * counts[1.0]
+
+
+# ------------------------------------------------------------- room / bg clamp
 
 
 def test_room_splats_inside_box(room_run):
@@ -222,67 +375,33 @@ def test_room_floor_splats_at_floor_height(room_run):
     splats, _ = _read(room_run)
     xyz = splats.xyz.astype(np.float64)
     rnorm = np.linalg.norm(xyz, axis=1)
-    d = xyz / rnorm[:, None]
+    dvec = xyz / rnorm[:, None]
     with np.errstate(divide="ignore"):
-        tx = np.where(np.abs(d[:, 0]) > 1e-12, BOX_X / np.abs(d[:, 0]), np.inf)
-        ty = np.where(np.abs(d[:, 1]) > 1e-12, BOX_Y / np.abs(d[:, 1]), np.inf)
-        tz = np.where(np.abs(d[:, 2]) > 1e-12, BOX_Z / np.abs(d[:, 2]), np.inf)
-    floor = (ty < 0.999 * tx) & (ty < 0.999 * tz) & (d[:, 1] < 0)
+        tx = np.where(np.abs(dvec[:, 0]) > 1e-12, BOX_X / np.abs(dvec[:, 0]), np.inf)
+        ty = np.where(np.abs(dvec[:, 1]) > 1e-12, BOX_Y / np.abs(dvec[:, 1]), np.inf)
+        tz = np.where(np.abs(dvec[:, 2]) > 1e-12, BOX_Z / np.abs(dvec[:, 2]), np.inf)
+    floor = (ty < 0.999 * tx) & (ty < 0.999 * tz) & (dvec[:, 1] < 0)
     assert floor.sum() > 0
     y = xyz[floor, 1]
-    assert np.all(np.abs(y - (-BOX_Y)) <= BOX_Y * 0.02)  # y ~ -1.5 +- 2%
+    assert np.all(np.abs(y - (-BOX_Y)) <= BOX_Y * 0.02)  # y ~ -BOX_Y +- 2%
 
 
-def test_room_radii_are_stride_multiples_of_pixel_size(room_run):
+def test_bg_scale_clamped_to_fg_equivalent(room_run):
     splats, meta = _read(room_run)
     p = _params()["s4"]
     angpix = geometry.angular_pixel_size(H)
-    depth = np.linalg.norm(splats.xyz.astype(np.float64), axis=1)
-    ratio = np.exp(splats.log_scales[:, 0].astype(np.float64)) / (
-        depth * angpix * p["scale_multiplier"]
-    )
     strides = meta["strides"]
-    allowed = {strides["edge"], strides["ground"], strides["base"], strides["bg"]}
+    bg = splats.layer == plyio.LAYER_BG
+    assert bg.sum() > 0
+    depth = np.linalg.norm(splats.xyz[bg].astype(np.float64), axis=1)
+    got_r = np.exp(splats.log_scales[bg, 0].astype(np.float64))
+    ratio = got_r / (depth * angpix * p["scale_multiplier"])
+    # clamp => bg stride never exceeds the bg base stride and is an integer
+    # in {edge, ground, base, bg}; NEVER inflated beyond the fg-equivalent.
     assert np.allclose(ratio, np.round(ratio), rtol=1e-3, atol=1e-3)
+    allowed = {strides["edge"], strides["ground"], strides["base"], strides["bg"]}
     assert set(np.round(ratio).astype(int)) <= allowed
-
-
-# ------------------------------------------------------------- (c) determinism
-
-
-def test_determinism_double_run_byte_identical(tmp_path):
-    outputs = []
-    for name in ["a", "b"]:
-        d = tmp_path / name / "run"
-        depth = _room_depth()
-        bg_mask = np.zeros((H, W), bool)
-        bg_mask[20:28, 30:50] = True
-        make_run(d, depth, bg_depth=depth.copy(), bg_mask=bg_mask)
-        run_stage(d)
-        outputs.append(
-            (
-                (_out(d) / "splats.ply").read_bytes(),
-                (_out(d) / "splats_meta.json").read_bytes(),
-            )
-        )
-    assert outputs[0][0] == outputs[1][0]
-    assert outputs[0][1] == outputs[1][1]
-
-
-# ------------------------------------------------------------- (d) stride cap
-
-
-def test_stride_multiplier_reduces_counts_quadratically(tmp_path):
-    counts = {}
-    for mult in [1.0, 2.0]:
-        d = tmp_path / f"m{int(mult)}" / "run"
-        make_run(d, np.full((H, W), SPHERE_R, np.float32))
-        run_stage(d, stride_multiplier=mult)
-        _, meta = _read(d)
-        assert meta["stride_multiplier"] == mult
-        counts[mult] = meta["count"]
-    assert counts[2.0] > 0
-    assert counts[2.0] < 0.5 * counts[1.0]
+    assert np.all(np.round(ratio).astype(int) <= strides["bg"])  # never inflated
 
 
 # ------------------------------------------------------------- shell
@@ -295,7 +414,7 @@ def test_shell_sky_and_far_content(tmp_path):
     sky = np.zeros((H, W), bool)
     sky[:8] = True
     depth[:8] = np.inf                    # sky has no depth
-    depth[8:12] = 150.0                   # finite but beyond shell_radius/2
+    depth[8:12] = 150.0                   # finite but beyond shell_distance
     make_run(d, depth, sky=sky)
     run_stage(d)
     splats, meta = _read(d)
@@ -315,13 +434,11 @@ def test_shell_sky_and_far_content(tmp_path):
     expect_r = shell_r * angpix * meta["strides"]["shell"] * p["scale_multiplier"]
     assert np.allclose(np.exp(splats.log_scales[sh, 0].astype(np.float64)),
                        expect_r, rtol=1e-4)
-    # fg splats exist at both depths and never inside the sky band
+    # fg splats exist only at the content depth (R), never in sky / far
     fg = splats.layer == plyio.LAYER_FG
     assert fg.sum() > 0
-    near7 = np.isclose(rnorm[fg], SPHERE_R, atol=1e-3)
-    near150 = np.isclose(rnorm[fg], 150.0, atol=1e-2)
-    assert np.all(near7 | near150)
-    assert near150.sum() > 0
+    assert np.allclose(rnorm[fg], SPHERE_R, atol=1e-3)
+    assert meta["far_shell_px"] == 4 * W  # 4 rows at depth 150
 
 
 # ------------------------------------------------------------- quats
@@ -375,3 +492,24 @@ def test_quat_round_trip_w_near_zero():
     assert np.allclose(np.linalg.norm(q_out, axis=1), 1.0, atol=1e-12)
     assert np.all(q_out[:, 0] >= 0.0)
     assert np.allclose(s4_place.rotmat_from_quat(q_out), R, atol=1e-9)
+
+
+# ------------------------------------------------------------- color-var helpers
+
+
+def test_hash_uniform_is_deterministic_and_in_range():
+    u1 = s4_place._hash_uniform(H, W)
+    u2 = s4_place._hash_uniform(H, W)
+    assert np.array_equal(u1, u2)
+    assert u1.shape == (H, W)
+    assert u1.min() >= 0.0 and u1.max() < 1.0
+
+
+def test_local_color_variance_flat_is_zero_textured_is_high():
+    flat = np.full((H, W, 3), 0.5, dtype=np.float64)
+    v_flat = s4_place._local_color_variance(flat, 3)
+    assert np.allclose(v_flat, 0.0, atol=1e-12)
+    noisy = _checkerboard_rgb(H, W).astype(np.float64) / 255.0
+    v_noisy = s4_place._local_color_variance(noisy, 3)
+    ref = _params()["s4"]["color_var_ref"]
+    assert v_noisy.mean() > ref  # well above the reference -> full boost

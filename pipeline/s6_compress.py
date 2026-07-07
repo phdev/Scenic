@@ -1,6 +1,8 @@
-"""s6_compress: prune / merge / cap enforcement + .sog packaging.
+"""s6_compress: two-profile prune / merge / cap enforcement + .sog packaging.
 
-Reads s4_place/out/splats.ply and applies, in order:
+Reads s4_place/out/splats.ply and, for EACH ship profile in
+`params.s6.profiles` (review, quest), applies the same pipeline in order:
+
   1. opacity floor        drop sigmoid(opacity_logit) < s6.opacity_floor
   2. kNN isolation prune  cKDTree on non-shell xyz; drop non-shell splats whose
                           distance to the k-th neighbor exceeds
@@ -8,22 +10,31 @@ Reads s4_place/out/splats.ply and applies, in order:
                           sparse and is excluded from both tree and pruning)
   3. duplicate merge      drop each BG splat whose nearest FG splat is closer
                           than merge_dist_factor * exp(max fg log_scale)
-  4. cap enforcement      while count > splat_cap and retries remain, re-run
+  4. cap enforcement      while count > PROFILE cap and retries remain, re-run
                           s4 placement with stride_multiplier *= 1.5 (this
                           rewrites the s4 outputs + receipt — documented,
                           logged behavior) and redo steps 1-3
 
-Then writes out/scene.ply (scenic layout), out/scene_std.ply (standard 3DGS
-layout, no scenic extra props), and out/scene.sog via the pinned
-splat-transform node tool. The .sog is a zip; it is re-normalized (entries
-sorted by name, fixed DOS epoch date, deflate level 6, zeroed attrs) so the
-bytes are deterministic. Counts per step land in out/compress.json.
+Profiles run in a FIXED order: every non-primary profile first (sorted), then
+`primary_profile` LAST, so the final on-disk s4 placement is deterministic and
+equals the primary (quest) coarsening. Each profile starts from a clean natural
+s4 baseline (multiplier 1.0) — if a prior profile coarsened s4 on disk, s4 is
+re-run at multiplier 1.0 first so profiles stay independent; s4 is deterministic
+so this reproduces the natural placement exactly.
+
+Outputs per profile: scene_<profile>.ply (scenic layout), scene_<profile>_std.ply
+(standard 3DGS layout, no scenic extra props), scene_<profile>.sog (the pinned
+splat-transform tool output, zip re-normalized for determinism). PRIMARY aliases
+scene.ply / scene_std.ply / scene.sog are byte copies of the primary_profile
+files (s7 gates load scene.ply — the shipped asset). Counts + byte sizes per
+profile land in out/compress.json.
 
 Pure numpy + scipy; no torch, no RNG.
 """
 from __future__ import annotations
 
 import importlib
+import shutil
 import subprocess
 import zipfile
 from pathlib import Path
@@ -177,7 +188,10 @@ def run(run_dir: Path, params: dict, ctx: Ctx) -> None:
     run_dir = Path(run_dir)
     out = ctx.out(run_dir, STAGE)
     p6 = params["s6"]
-    cap = int(params["splat_cap"])
+    profiles_cfg = p6["profiles"]
+    primary = str(p6["primary_profile"])
+    viewer = str(p6["viewer_profile"])
+    max_retries = int(p6["max_stride_retries"])
     splats_path = run_dir / "s4_place" / "out" / "splats.ply"
     if not splats_path.exists():
         raise FileNotFoundError(f"missing s4 output {splats_path}")
@@ -193,62 +207,110 @@ def run(run_dir: Path, params: dict, ctx: Ctx) -> None:
         counts["after_merge"] = len(s)
         return s, counts
 
-    s, counts = steps()
-
-    # step 4: cap enforcement via s4 re-placement with a coarser stride
-    stride_retries: list[dict] = []
-    multiplier = 1.0
-    while len(s) > cap and len(stride_retries) < int(p6["max_stride_retries"]):
-        multiplier *= 1.5
-        count_before = len(s)
+    def rerun_s4(multiplier: float) -> None:
+        # importlib each time so a test monkeypatch of sys.modules is honored.
         s4_place = importlib.import_module("pipeline.s4_place")
         s4_place.run(run_dir, params, ctx, stride_multiplier=multiplier)
+
+    # Fixed profile order: every non-primary profile first (sorted for
+    # determinism), then the primary profile LAST so the final on-disk s4
+    # placement is the primary (quest) coarsening. For {review, quest} this is
+    # exactly [review, quest].
+    order = sorted(k for k in profiles_cfg if k != primary) + [primary]
+
+    # s4's natural placement (multiplier 1.0) is on disk when s6 begins.
+    disk_multiplier = 1.0
+    results: dict[str, tuple[plyio.SplatData, dict, list]] = {}
+
+    for name in order:
+        cap = int(profiles_cfg[name]["cap"])
+        # Clean natural baseline: if a prior profile coarsened s4, reset it so
+        # profiles are independent. s4 is deterministic -> reproduces natural.
+        if disk_multiplier != 1.0:
+            rerun_s4(1.0)
+            disk_multiplier = 1.0
+        multiplier = 1.0
         s, counts = steps()
-        stride_retries.append({
-            "multiplier": multiplier,
-            "count_before": count_before,
-            "count_after": len(s),
-        })
+        stride_retries: list[dict] = []
+        while len(s) > cap and len(stride_retries) < max_retries:
+            multiplier *= 1.5
+            count_before = len(s)
+            rerun_s4(multiplier)
+            disk_multiplier = multiplier
+            s, counts = steps()
+            stride_retries.append({
+                "multiplier": multiplier,
+                "count_before": count_before,
+                "count_after": len(s),
+            })
+        results[name] = (s, counts, stride_retries)
 
-    # step 5: scenic master ply
-    scene_ply = out / "scene.ply"
-    plyio.write_splats(scene_ply, s)
+    # Per-profile artifacts + compress.profiles entries.
+    profiles_json: dict[str, dict] = {}
+    outputs: dict[str, Path] = {}
+    for name in order:
+        s, counts, stride_retries = results[name]
+        cfg = profiles_cfg[name]
+        scene_ply = out / f"scene_{name}.ply"
+        std_ply = out / f"scene_{name}_std.ply"
+        sog_path = out / f"scene_{name}.sog"
+        plyio.write_splats(scene_ply, s)
+        write_std_ply(std_ply, s)
+        ply_to_sog(std_ply, sog_path, ctx.repo_root)
+        profiles_json[name] = {
+            "in_count": counts["in_count"],
+            "after_opacity_floor": counts["after_opacity_floor"],
+            "after_isolation_prune": counts["after_isolation_prune"],
+            "after_merge": counts["after_merge"],
+            "final_count": len(s),
+            "stride_retries": stride_retries,
+            "ply_bytes": int(scene_ply.stat().st_size),
+            "sog_bytes": int(sog_path.stat().st_size),
+            "target": int(cfg["target"]),
+            "cap": int(cfg["cap"]),
+            "sog_max_mb": float(cfg["sog_max_mb"]),
+        }
+        outputs[f"scene_{name}"] = scene_ply
+        outputs[f"scene_{name}_std"] = std_ply
+        outputs[f"scene_{name}_sog"] = sog_path
 
-    # step 6: standard 3DGS ply -> .sog (zip re-normalized for determinism)
-    std_ply = out / "scene_std.ply"
-    write_std_ply(std_ply, s)
-    sog_path = out / "scene.sog"
-    ply_to_sog(std_ply, sog_path, ctx.repo_root)
+    # PRIMARY aliases: byte copies of the primary profile's files.
+    scene_alias = out / "scene.ply"
+    std_alias = out / "scene_std.ply"
+    sog_alias = out / "scene.sog"
+    shutil.copyfile(out / f"scene_{primary}.ply", scene_alias)
+    shutil.copyfile(out / f"scene_{primary}_std.ply", std_alias)
+    shutil.copyfile(out / f"scene_{primary}.sog", sog_alias)
+    outputs["scene"] = scene_alias
+    outputs["scene_std"] = std_alias
+    outputs["sog"] = sog_alias
 
     compress = {
-        **counts,
-        "final_count": len(s),
-        "stride_retries": stride_retries,
-        "sog_bytes": int(sog_path.stat().st_size),
         "sog_tool": SOG_TOOL,
+        "primary_profile": primary,
+        "viewer_profile": viewer,
+        "profiles": profiles_json,
     }
     schema.write_validated(out / "compress.json", compress, "compress")
+    outputs["compress"] = out / "compress.json"
 
     receipts.write_receipt(
         run_dir,
         STAGE,
         inputs={"splats": splats_path},
-        outputs={
-            "scene": scene_ply,
-            "scene_std": std_ply,
-            "sog": sog_path,
-            "compress": out / "compress.json",
-        },
-        params_used={"s6": p6, "splat_cap": cap},
+        outputs=outputs,
+        params_used={"s6": p6},
         weights_used=[],
         notes={
-            "counts": {
-                "in_count": counts["in_count"],
-                "after_opacity_floor": counts["after_opacity_floor"],
-                "after_isolation_prune": counts["after_isolation_prune"],
-                "after_merge": counts["after_merge"],
-                "final_count": len(s),
+            "primary_profile": primary,
+            "viewer_profile": viewer,
+            "profiles": {
+                name: {
+                    "final_count": profiles_json[name]["final_count"],
+                    "sog_bytes": profiles_json[name]["sog_bytes"],
+                    "stride_retry_count": len(profiles_json[name]["stride_retries"]),
+                }
+                for name in order
             },
-            "stride_retry_count": len(stride_retries),
         },
     )

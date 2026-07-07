@@ -9,6 +9,8 @@ head_box:
 camera_height_m_default: 1.6
 min_content_distance_m: 6.0
 
+# Primary (Quest ship) budget. The s6 `quest` profile mirrors these; s7
+# budgets + s4 exceeds_cap read them. The `review` profile is separate.
 splat_target: 600000
 splat_cap: 1000000
 sog_max_mb: 60
@@ -19,9 +21,13 @@ resolutions:
   depth_equirect_w: 1024    # fused low-res depth before guided upsample
   sampling_w: 2048          # sampling resolution ceiling (clamped to pano width)
 
-cubemap:
-  fov_deg: 100.0
+# 8-face horizon ring (~100deg FOV, 45deg spacing) + zenith/nadir caps.
+faces:
+  ring_count: 8
+  ring_fov_deg: 100.0
+  cap_fov_deg: 100.0
   overlap_min_weight: 0.02
+  max_infer_px: 518         # per-face DA-V2 inference res; tile if > this
 
 s0:
   person_score_min: 0.5
@@ -39,6 +45,10 @@ s2:
   sky_min_pitch_deg: 0.0
   guided_radius_px: 8
   guided_eps: 0.0001
+  huber_delta_log: 0.15         # Huber transition in log-depth for the global solve
+  huber_iters: 8                # fixed IRLS iterations (deterministic)
+  affine_reg: 0.001             # Tikhonov gauge pull toward identity
+  interface_step_max_log: 0.60  # GATE: max inter-face depth step on overlaps (log)
 
 s2b:
   nadir_cone_pitch_deg: -45.0
@@ -51,27 +61,51 @@ s2b:
 
 s3:
   edge_log_grad_min: 0.30
+  edge_depth_ratio_min: 1.4    # occlusion edge requires d_far/d_near > this
   band_extra_px: 2
+  band_px_max: 64              # hard cap on the analytic inpaint band
   pyramid_min_size: 4
+  bg_solid_angle_max_frac: 0.05  # GATE: bg layer solid-angle coverage ceiling
+  bg_scale_clamp: true         # clamp bg splat scale to fg-equivalent at same depth
 
 s4:
   base_stride: 2
   edge_boost: 4.0
   ground_boost: 2.0
   ground_band_pitch_deg: -20.0
-  scale_multiplier: 1.2
+  scale_multiplier: 1.15       # sweep-optimal for fidelity_at_origin worst-tile SSIM.
+                               # 0.85 (chosen for "less blur") sits below gap-free
+                               # coverage -> screen-door gaps that hurt SSIM more than
+                               # mild blur; 1.35 over-blurs. Peak worst-tile SSIM at ~1.15.
+                               # (was 1.2 pre-v2, then 0.85; see tools/sweep.py)
   flatten_ratio: 0.15
-  shell_radius_m: 200.0
+  shell_radius_m: 200.0        # sphere the textured shell sits on
+  shell_distance_m: 50.0       # depth > this (or < min_content) routes to shell
+  feather_m: 5.0               # opacity ramp width at the splat/shell frontier
   shell_stride: 4
   fg_opacity: 0.98
   bg_opacity: 0.95
+  color_var_boost: 3.0         # max importance multiplier from local color variance
+  color_var_window_px: 3       # half-window for local color variance
+  color_var_ref: 0.04          # variance (in [0,1] rgb) mapping to full boost
 
 s6:
   opacity_floor: 0.05
   knn_k: 4
   isolation_factor: 8.0
   merge_dist_factor: 0.25
-  max_stride_retries: 4
+  max_stride_retries: 6
+  primary_profile: quest       # scene.ply/.sog (gated by s7)
+  viewer_profile: review       # s8 inline viewer + SOG-quant reference
+  profiles:
+    review:
+      target: 1500000
+      cap: 2000000
+      sog_max_mb: 0            # 0 = unbounded (inspection asset)
+    quest:
+      target: 600000
+      cap: 1000000
+      sog_max_mb: 60
 
 s7:
   render_px: 512
@@ -88,5 +122,13 @@ s7:
   stereo_near_depth_min_m: 0.75
   stereo_order_min_frac: 0.98
   people_score_min: 0.5
+  layers: true                # emit fg/bg/shell-only origin renders + coverage
+  fidelity:
+    tiles_lon: 8
+    tiles_lat: 4
+    render_px: 512
+    ssim_worst_tile_min: 0.30   # enforced fidelity floor (calibrated to a faithful render)
+    ssim_mean_min: 0.55         # enforced fidelity floor
+    lpips_advisory: true        # advisory-only; weights not provisioned by default
 
 seed: 0

@@ -20,14 +20,31 @@ from pathlib import Path
 import numpy as np
 
 from scenic import imageio
-from scenic.plyio import LAYER_SHELL, SplatData, dc_to_rgb01
+from scenic.plyio import (
+    LAYER_BG,
+    LAYER_FG,
+    LAYER_SHELL,
+    SplatData,
+    dc_to_rgb01,
+)
 from scenic.rasterizer import Camera, render
 
-# The five gates, in the order s7 runs them and embeds them in its receipt.
-GATE_ORDER = ("hole", "jitter", "stereo", "people", "budgets")
+# The six gates, in the order s7 runs them and embeds them in its receipt.
+# `fidelity_at_origin` is the v2 quality-pass fidelity floor (gates/fidelity.py).
+GATE_ORDER = (
+    "hole", "jitter", "stereo", "people", "budgets", "fidelity_at_origin",
+)
 
 # Views per pose: yaw ring at pitch 0 (fov/res come from params s7).
 YAWS_DEG = (0.0, 90.0, 180.0, 270.0)
+
+# Layer forensics: (layer value, short name), in the fixed fg -> bg -> shell
+# order used for the origin layer renders and the receipt notes.
+LAYER_ITEMS: tuple[tuple[int, str], ...] = (
+    (LAYER_FG, "fg"),
+    (LAYER_BG, "bg"),
+    (LAYER_SHELL, "shell"),
+)
 
 MAGENTA = (1.0, 0.0, 1.0)
 
@@ -89,3 +106,51 @@ def renders_dir(outdir: Path | str) -> Path:
 
 def save_render(outdir: Path | str, name: str, rgb: np.ndarray) -> None:
     imageio.save_png(renders_dir(outdir) / name, rgb)
+
+
+def layer_subset(splats: SplatData, layer_value: int) -> SplatData:
+    """Filter to just the splats of one layer (fg/bg/shell)."""
+    return splats.take(splats.layer == int(layer_value))
+
+
+def layer_direction_mask(
+    xyz: np.ndarray, h: int = 256, w: int = 512
+) -> np.ndarray:
+    """Boolean equirect (h,w) mask of the direction bins a layer's splats
+    occupy, seen from the ORIGIN. Deterministic, closed-form: project each
+    splat's world xyz to (lon, lat) using the docs/CONTRACTS convention and
+    mark its bin. Feeds metrics.solid_angle_fraction for the receipt's
+    per-layer coverage note (an approximation, not a render)."""
+    mask = np.zeros((int(h), int(w)), dtype=bool)
+    xyz = np.asarray(xyz, dtype=np.float64)
+    if xyz.shape[0] == 0:
+        return mask
+    r = np.maximum(np.linalg.norm(xyz, axis=1), 1e-12)
+    lon = np.arctan2(xyz[:, 0], xyz[:, 2])                 # [-pi, pi]
+    lat = np.arcsin(np.clip(xyz[:, 1] / r, -1.0, 1.0))     # [-pi/2, pi/2]
+    col = np.floor((lon + np.pi) / (2.0 * np.pi) * w).astype(np.int64) % w
+    row = np.clip(
+        np.floor((np.pi / 2.0 - lat) / np.pi * h).astype(np.int64), 0, h - 1
+    )
+    mask[row, col] = True
+    return mask
+
+
+def render_layer_view_and_save(
+    splats: SplatData,
+    params: dict,
+    outdir: Path | str,
+    layer_value: int,
+    layer_name: str,
+    yaw_deg: float,
+) -> dict:
+    """Render ONE origin (center pose) layer-filtered view and save it as
+    center_yaw{NNN}_layer_{layer_name}.png. Returns the render dict."""
+    sub = layer_subset(splats, layer_value)
+    out = render_view(sub, params, np.zeros(3), yaw_deg)
+    save_render(
+        outdir,
+        f"center_yaw{int(round(yaw_deg)):03d}_layer_{layer_name}.png",
+        out["rgb"],
+    )
+    return out
