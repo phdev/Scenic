@@ -2,14 +2,18 @@
 shell dyed magenta; any magenta (or zero-alpha) pixel below the skyline is a
 coverage hole in the placed content.
 
-Per view (7 poses x 4 yaws):
+Per view (7 poses x 5 views: the 4-yaw pitch-0 ring + the straight-down
+nadir view — the pitch-0 fov-90 ring only reaches ray pitch ~-45 deg, and
+the nadir is where real defects live):
 - magenta pixel:  r > 0.6, b > 0.6, g < 0.35 (float01, after compositing) —
   generous thresholds so blended shell still counts.
 - alpha hole:     composite alpha < 0.05 (a true hole: the ray hit nothing) —
   tracked as a separate metric but failing under the same frac threshold.
 - below skyline:  pixel ray pitch < -2 deg (translation does not change ray
-  directions, so the mask is shared across poses; for pitch-0 cameras it is
-  also yaw-invariant and computed once).
+  directions, so the mask is shared across poses; it is yaw-invariant per
+  camera pitch and computed once per distinct pitch). For the straight-down
+  view every ray qualifies (mask all-True), so the central-blob check
+  covers the nadir directly.
 
 FAIL if, in ANY view, magenta_below_skyline_frac > s7.hole_max_frac, or
 alpha_below_skyline_frac > s7.hole_max_frac, or any connected blob of hole
@@ -25,8 +29,8 @@ above the horizon the magenta shell IS the sky by construction, so a central
 window straddling the horizon would otherwise flag every legitimate sky
 view.
 
-Diagnostics: center-pose magenta renders (all 4 yaws, reused by s8) plus the
-worst view, under outdir/renders/.
+Diagnostics: center-pose magenta renders (all 4 yaws, reused by s8, plus the
+down view) and the worst view, under outdir/renders/.
 """
 from __future__ import annotations
 
@@ -39,8 +43,8 @@ from scenic import geometry
 from scenic.plyio import SplatData
 
 from gates import (
-    YAWS_DEG,
     head_box_poses,
+    pose_views,
     render_view,
     save_render,
     shell_magenta_override,
@@ -54,10 +58,13 @@ MAGENTA_G_MAX = 0.35
 ALPHA_HOLE_MAX = 0.05
 
 
-def _below_skyline_mask(px: int, fov_deg: float) -> np.ndarray:
-    """Bool (px,px): pixel ray pitch < SKYLINE_PITCH_DEG for a pitch-0 view.
-    Yaw-invariant (yaw rotates about +Y, preserving each ray's pitch)."""
-    dirs = geometry.perspective_dirs(fov_deg, px, px, 0.0, 0.0)
+def _below_skyline_mask(px: int, fov_deg: float, pitch_deg: float) -> np.ndarray:
+    """Bool (px,px): pixel ray pitch < SKYLINE_PITCH_DEG for a camera at the
+    given pitch. Yaw-invariant per pitch (yaw rotates about +Y, preserving
+    each ray's pitch); for the straight-down view it is all-True."""
+    dirs = geometry.perspective_dirs(
+        fov_deg, px, px, 0.0, float(np.deg2rad(pitch_deg))
+    )
     return geometry.pitch_of_dirs(dirs) < np.deg2rad(SKYLINE_PITCH_DEG)
 
 
@@ -84,8 +91,14 @@ def run_gate(splats: SplatData, params: dict, outdir: Path | str) -> dict:
     center_frac = float(s7["hole_center_frac"])
 
     override = shell_magenta_override(splats)
-    below = _below_skyline_mask(px, fov)
-    n_below = int(below.sum())
+    views = pose_views()
+    # One skyline mask per distinct camera pitch (yaw-invariant); the view
+    # list is the deterministic iteration order.
+    below_by_pitch = {
+        pitch: _below_skyline_mask(px, fov, pitch)
+        for pitch in dict.fromkeys(p for _, p in views)
+    }
+    n_below_by_pitch = {p: int(m.sum()) for p, m in below_by_pitch.items()}
     lo, hi = _center_window(px, center_frac)
 
     per_view: list[dict] = []
@@ -97,9 +110,13 @@ def run_gate(splats: SplatData, params: dict, outdir: Path | str) -> dict:
     worst_rgb: np.ndarray | None = None
 
     for pose_name, pos in head_box_poses(params):
-        for yaw in YAWS_DEG:
-            name = view_name(pose_name, yaw)
-            out = render_view(splats, params, pos, yaw, override_rgb=override)
+        for yaw, pitch in views:
+            name = view_name(pose_name, yaw, pitch)
+            below = below_by_pitch[pitch]
+            n_below = n_below_by_pitch[pitch]
+            out = render_view(
+                splats, params, pos, yaw, pitch, override_rgb=override
+            )
             rgb01 = out["rgb"].astype(np.float64) / 255.0
             magenta = (
                 (rgb01[..., 0] > MAGENTA_R_MIN)
@@ -130,8 +147,12 @@ def run_gate(splats: SplatData, params: dict, outdir: Path | str) -> dict:
                 worst_view = name
                 worst_rgb = out["rgb"]
             if pose_name == "center":
-                save_render(outdir, f"center_yaw{int(yaw):03d}_magenta.png",
-                            out["rgb"])
+                save_render(
+                    outdir,
+                    ("center_down_magenta.png" if pitch != 0.0
+                     else f"center_yaw{int(yaw):03d}_magenta.png"),
+                    out["rgb"],
+                )
 
     if worst_rgb is not None:
         save_render(outdir, "hole_worst_magenta.png", worst_rgb)

@@ -35,10 +35,11 @@ review:
 	open $(OUT)/s8_review/out/index.html
 
 # Promote a completed run to the runs/_accepted baseline that s8_review
-# compares against. Refuses shippable=false runs unless FORCE=1.
+# compares against. Refuses shippable=false runs unless FORCE=1 (FORCE=0 is
+# off, not on — filter-out guards against truthy-empty confusion).
 accept:
 	@test -n "$(RUN)" || { echo "usage: make accept RUN=runs/<name> [FORCE=1]"; exit 2; }
-	$(UV) run python tools/accept_run.py $(RUN) $(if $(FORCE),--allow-failed-gates,)
+	$(UV) run python tools/accept_run.py $(RUN) $(if $(filter-out 0,$(FORCE)),--allow-failed-gates,)
 
 clean:
 	rm -rf runs

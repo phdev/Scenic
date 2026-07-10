@@ -8,8 +8,9 @@ views), and for every tile:
 - render the PRIMARY splats (normal colors, no override) from the origin
   (Camera pos 0) at the tile's yaw/pitch/fov via scenic.rasterizer.render;
 - sample the SOURCE pano into the SAME perspective via
-  geometry.render_perspective — the s1 clean plate if present, else the s0
-  ingest master;
+  geometry.render_perspective — the s1 clean plate, which a complete run
+  ALWAYS writes (passthrough byte-copies the master); a missing clean plate
+  is a hard error, never a silent fallback to the uncleaned s0 master;
 - score SSIM (the enforced fidelity metric) between the two tiles.
 
 PASS iff the WORST tile SSIM >= s7.fidelity.ssim_worst_tile_min AND the MEAN
@@ -41,17 +42,17 @@ from gates import save_render
 
 
 def _source_pano_path(run_dir: Path) -> Path:
-    """The s1 clean plate if it exists, else the s0 ingest master. Raises if
-    neither is present (a hard error: there is nothing to compare against)."""
+    """The s1 clean plate — REQUIRED. s1 always writes pano_clean.png in a
+    complete run (passthrough byte-copies the master), so a missing clean
+    plate means a broken run: raise rather than silently scoring fidelity
+    against the uncleaned s0 master."""
     run_dir = Path(run_dir)
     clean = run_dir / "s1_cleanplate" / "out" / "pano_clean.png"
     if clean.exists():
         return clean
-    ingest = run_dir / "s0_ingest" / "out" / "pano.png"
-    if ingest.exists():
-        return ingest
     raise FileNotFoundError(
-        f"fidelity gate: no source pano at {clean} or {ingest}"
+        f"fidelity gate: missing s1 clean plate at {clean} (s1 always writes "
+        "it in a complete run; refusing to fall back to the uncleaned s0 pano)"
     )
 
 

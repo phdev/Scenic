@@ -2,10 +2,12 @@
 
 Loads s6_compress/out/scene.ply ONCE (the shipped quest asset) and runs the
 six gate modules (gates/{hole,jitter,stereo,people,budgets,fidelity}.py) over
-the shared head-box pose/view matrix. Each verdict is schema-validated
-(gate_verdict) and written to out/verdicts/<gate>.json; diagnostic +
-representative renders (center pose, 4 yaws, normal via the people gate,
-magenta via the hole gate, worst fidelity tile) land in out/renders/.
+the shared head-box pose/view matrix (4-yaw pitch-0 ring + straight-down
+nadir view per pose). Each verdict is schema-validated (gate_verdict) and
+written to out/verdicts/<gate>.json; diagnostic + representative renders
+(center pose, 4 yaws + down, normal via the people gate, magenta via the
+hole gate, worst fidelity tile) land in out/renders/ and are content-hashed
+into the receipt outputs alongside the verdicts.
 
 Layer forensics (v2 quality pass, params.s7.layers): for the center pose and
 the 4-yaw ring, the primary scene is re-rendered three extra times from the
@@ -96,14 +98,30 @@ def run(run_dir: Path, params: dict, ctx: Ctx) -> None:
                 metrics.solid_angle_fraction(layer_direction_mask(sub_xyz))
             )
 
+    # Every render the gates + layer forensics produced is content-hashed
+    # into the receipt outputs. The sorted glob is deterministic here because
+    # the harness clears each stage's out/ dir before the stage runs, so only
+    # this run's renders can be present.
     render_names = sorted(p.name for p in (out / "renders").glob("*.png"))
+    outputs = {
+        f"verdict_{g}": verdicts_dir / f"{g}.json" for g in GATE_ORDER
+    }
+    outputs.update(
+        {
+            f"render_{Path(name).stem}": out / "renders" / name
+            for name in render_names
+        }
+    )
     receipts.write_receipt(
         run_dir,
         STAGE,
-        inputs={"scene": scene_path, "compress": compress_path},
-        outputs={
-            f"verdict_{g}": verdicts_dir / f"{g}.json" for g in GATE_ORDER
+        inputs={
+            "scene": scene_path,
+            "compress": compress_path,
+            "sog": sog_path,
+            "pano_clean": run_dir / "s1_cleanplate" / "out" / "pano_clean.png",
         },
+        outputs=outputs,
         params_used={
             "head_box": params["head_box"],
             "s7": params["s7"],

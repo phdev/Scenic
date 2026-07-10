@@ -3,19 +3,25 @@
 Synthetic scenes built directly as SplatData (no upstream stages):
 
 - PASS scene: a closed lat-long sphere shell (r=10, mildly checkered gray)
-  enclosing a ground disk at y=-1.6, with a LAYER_SHELL sphere at r=30
-  hidden behind the content. All six gates pass (fidelity thresholds are
-  relaxed to -1 in tests since the synthetic pano is not the synthetic scene).
+  enclosing a ground disk at y=-1.6 (genuine nadir coverage for the
+  straight-down views), with a LAYER_SHELL sphere at r=30 hidden behind the
+  content. All six gates pass (fidelity thresholds are relaxed to -1 in
+  tests since the synthetic pano is not the synthetic scene).
 - Wedge scenes: the same scene minus all content splats in a solid angle
   below the horizon. With the shell present the hole gate must fail via
   magenta; without it, via alpha — falsifiability both ways.
-- Near scene: PASS scene + one opaque splat 0.3 m ahead -> stereo near-limit
-  fails.
+- Nadir-cut scene: PASS scene minus everything below pitch -50 deg (no
+  shell behind) — invisible to the pitch-0 view ring, must fail via the
+  down view (the nadir-blind-cone regression).
+- Near scenes: PASS scene + one opaque splat 0.3 m away, dead ahead or at
+  azimuth 45 deg (the near-limit-blind-wedge regression) -> stereo
+  near-limit fails.
 - Budgets: fake s6 dir (scene.ply + two-profile compress.json + scene.sog
   stub); pass at real params, fail under a monkeypatched cap / sog limit;
   reads the QUEST profile.
-- Fidelity: a fake run dir with s0_ingest/out/pano.png; SSIM per tile,
-  advisory LPIPS unavailable, falsifiable via an impossible threshold.
+- Fidelity: a fake run dir with s1_cleanplate/out/pano_clean.png (REQUIRED —
+  no s0 fallback); SSIM per tile, advisory LPIPS unavailable, falsifiable
+  via an impossible threshold.
 
 render_px is reduced via params override so CPU renders stay fast.
 """
@@ -97,6 +103,15 @@ def _cut_wedge(xyz: np.ndarray, shade: np.ndarray):
         & (pitch > WEDGE_PITCH[0]) & (pitch < WEDGE_PITCH[1])
     )
     return xyz[~cut], shade[~cut]
+
+
+def _cut_below_pitch(splats: plyio.SplatData, pitch_deg: float) -> plyio.SplatData:
+    """Drop every splat whose direction from the origin sits below pitch_deg
+    (the nadir cone — invisible to the pitch-0 fov-90 view ring)."""
+    xyz = splats.xyz.astype(np.float64)
+    r = np.maximum(np.linalg.norm(xyz, axis=1), 1e-9)
+    pitch = np.degrees(np.arcsin(np.clip(xyz[:, 1] / r, -1.0, 1.0)))
+    return splats.take(pitch >= pitch_deg)
 
 
 def make_scene(
@@ -197,9 +212,10 @@ def make_s6_dir(run_dir: Path, scene: plyio.SplatData,
     schema.write_validated(out / "compress.json", compress, "compress")
 
 
-def make_source_pano(run_dir: Path, kind: str = "ingest",
+def make_source_pano(run_dir: Path, kind: str = "clean",
                      w: int = 256, h: int = 128) -> Path:
-    """Deterministic equirect source pano (s0 ingest master, or s1 clean)."""
+    """Deterministic equirect source pano (s1 clean plate — the fidelity
+    gate's required source — or the s0 ingest master)."""
     if kind == "ingest":
         d = run_dir / "s0_ingest" / "out"
         name = "pano.png"
@@ -258,6 +274,9 @@ def test_stage_representative_renders(stage_run):
         assert (rdir / f"center_yaw{yaw}_normal.png").exists()
         for layer in ("fg", "bg", "shell"):
             assert (rdir / f"center_yaw{yaw}_layer_{layer}.png").exists()
+    # the straight-down nadir view is part of the standard matrix
+    assert (rdir / "center_down_magenta.png").exists()
+    assert (rdir / "center_down_normal.png").exists()
     for extra in ("jitter_base.png", "jitter_offset.png",
                   "stereo_yaw000_left.png", "stereo_yaw000_right.png",
                   "hole_worst_magenta.png", "fidelity_worst_render.png",
@@ -276,8 +295,18 @@ def test_stage_receipt(stage_run):
         "head_box", "s7", "splat_cap", "splat_target", "sog_max_mb"
     }
     assert rec["params_used"]["s7"] == params["s7"]
-    assert set(rec["inputs"]) == {"scene", "compress"}
-    assert set(rec["outputs"]) == {f"verdict_{g}" for g in GATE_ORDER}
+    # provenance: the receipt covers everything the stage read (incl. the
+    # gated .sog + the fidelity source pano) and every render it produced
+    assert set(rec["inputs"]) == {"scene", "compress", "sog", "pano_clean"}
+    assert rec["inputs"]["pano_clean"]["path"] == (
+        "s1_cleanplate/out/pano_clean.png")
+    render_keys = {
+        f"render_{n[:-len('.png')]}" for n in rec["notes"]["renders"]
+    }
+    assert set(rec["outputs"]) == (
+        {f"verdict_{g}" for g in GATE_ORDER} | render_keys
+    )
+    assert len(render_keys) == len(rec["notes"]["renders"])  # stems unique
     for v in list(rec["inputs"].values()) + list(rec["outputs"].values()):
         assert not v["path"].startswith("/")
     rdir = d / "s7_gates" / "out" / "renders"
@@ -311,8 +340,11 @@ def test_hole_passes_closed_scene(stage_run):
     assert m["worst_magenta_below_skyline_frac"] <= params["s7"]["hole_max_frac"]
     assert m["worst_alpha_below_skyline_frac"] <= params["s7"]["hole_max_frac"]
     assert m["worst_blob_px"] <= params["s7"]["hole_blob_max_px"]
-    assert m["n_views"] == 28
-    assert len(v["details"]["per_view"]) == 28
+    # 7 poses x (4 pitch-0 yaws + 1 straight-down view)
+    assert m["n_views"] == 35
+    assert len(v["details"]["per_view"]) == 35
+    views = {pv["view"] for pv in v["details"]["per_view"]}
+    assert "center_down" in views and "squat_down" in views
 
 
 def test_hole_fails_on_wedge_magenta(tmp_path):
@@ -356,6 +388,25 @@ def test_hole_fails_on_wedge_alpha_without_shell(tmp_path):
     assert v["metrics"]["worst_magenta_below_skyline_frac"] == 0.0
 
 
+def test_hole_fails_on_nadir_cut(tmp_path):
+    """Regression (nadir blind cone): deleting ALL splats below pitch -50 deg
+    with no shell behind is invisible to the pitch-0 fov-90 ring (its rays
+    only reach ~-45 deg) — the straight-down views must fail the gate."""
+    scene = _cut_below_pitch(make_scene(), -50.0)
+    params = stage_params()
+    v = hole.run_gate(scene, params, tmp_path)
+    schema.validate(v, "gate_verdict")
+    assert v["pass"] is False
+    per = {pv["view"]: pv for pv in v["details"]["per_view"]}
+    # the hole shows up as an alpha void in the down view...
+    assert per["center_down"]["alpha_frac"] > params["s7"]["hole_max_frac"]
+    # ... while the pitch-0 ring still sees nothing (the old blind spot)
+    for yaw in ("000", "090", "180", "270"):
+        pv = per[f"center_yaw{yaw}"]
+        assert pv["alpha_frac"] <= params["s7"]["hole_max_frac"]
+        assert pv["magenta_frac"] <= params["s7"]["hole_max_frac"]
+
+
 # ------------------------------------------------------------------ jitter
 
 
@@ -365,6 +416,14 @@ def test_jitter_passes_static_scene(stage_run):
     assert v["pass"] is True
     assert 0.0 <= v["metrics"]["energy"] <= params["s7"]["jitter_energy_max"]
     assert v["thresholds"]["jitter_offset_m"] == params["s7"]["jitter_offset_m"]
+    # all 5 center-pose views certified; the metric is the worst of them
+    per = v["details"]["per_view"]
+    assert [pv["view"] for pv in per] == [
+        "center_yaw000", "center_yaw090", "center_yaw180", "center_yaw270",
+        "center_down",
+    ]
+    assert v["metrics"]["energy"] == max(pv["energy"] for pv in per)
+    assert v["details"]["worst_view"] in {pv["view"] for pv in per}
 
 
 def test_jitter_threshold_falsifiable(tmp_path):
@@ -396,9 +455,20 @@ def test_stereo_passes(stage_run):
     assert m["vdisp_max_px"] <= params["s7"]["stereo_vdisp_max_px"]
     assert m["min_depth_m"] >= params["s7"]["stereo_near_depth_min_m"]
     assert m["order_min_frac"] >= params["s7"]["stereo_order_min_frac"]
-    assert len(v["details"]["per_yaw"]) == 4
-    # the scene's nearest central content is the ground several meters out
-    assert m["min_depth_m"] > 2.0
+    # 4 full yaw entries + 2 near-limit-only pitched entries (down, up)
+    per = v["details"]["per_yaw"]
+    assert len(per) == 6
+    ring = [e for e in per if not e["near_only"]]
+    polar = [e for e in per if e["near_only"]]
+    assert [e["pitch_deg"] for e in ring] == [0.0] * 4
+    assert [e["pitch_deg"] for e in polar] == [-90.0, 90.0]
+    for e in ring:
+        assert {"vdisp_px", "order_frac", "n_order_px"} <= set(e)
+    for e in polar:  # near-only rows: no vdisp / order fields
+        assert "vdisp_px" not in e and "order_frac" not in e
+        assert e["min_depth_m"] >= params["s7"]["stereo_near_depth_min_m"]
+    # the nearest content overall is the ground ~1.6 m below (down view)
+    assert 1.0 < m["min_depth_m"] < 2.5
 
 
 def test_stereo_near_limit_fails(tmp_path):
@@ -412,6 +482,24 @@ def test_stereo_near_limit_fails(tmp_path):
     assert (tmp_path / "renders" / "stereo_yaw000_left.png").exists()
 
 
+def test_stereo_near_limit_fails_off_axis(tmp_path):
+    """Regression (near-limit blind wedge): an opaque splat 0.3 m away at
+    azimuth 45 deg sits outside every view's old central-half window (only
+    +-26.5 deg per yaw was checked) — the full-frame near limit must now
+    record min_depth_m < 0.75 and fail the gate."""
+    az = np.deg2rad(45.0)
+    near = _splats(
+        [[0.3 * np.sin(az), 0.0, 0.3 * np.cos(az)]], (0.5, 0.5, 0.5),
+        plyio.LAYER_FG, opacity=0.99, scale=0.08,
+    )
+    scene = plyio.SplatData.concat([make_scene(), near])
+    params = stage_params()
+    v = stereo.run_gate(scene, params, tmp_path)
+    schema.validate(v, "gate_verdict")
+    assert v["pass"] is False
+    assert v["metrics"]["min_depth_m"] < params["s7"]["stereo_near_depth_min_m"]
+
+
 # ------------------------------------------------------------------ people
 
 
@@ -421,7 +509,8 @@ def test_people_passes(stage_run):
     assert v["pass"] is True
     assert v["metrics"]["n_detections"] == 0
     assert 0.0 <= v["metrics"]["max_score"] < params["s7"]["people_score_min"]
-    assert len(v["details"]["per_view"]) == 28
+    # 7 poses x (4 yaws + down), same matrix as the hole gate
+    assert len(v["details"]["per_view"]) == 35
 
 
 # ----------------------------------------------------------------- budgets
@@ -499,7 +588,7 @@ def test_budgets_sog_violation_fails(stage_run):
 # ---------------------------------------------------------------- fidelity
 
 
-def _fidelity_run_dir(tmp_path, kind="ingest", nt=24, npi=12):
+def _fidelity_run_dir(tmp_path, kind="clean", nt=24, npi=12):
     """Fake run dir with a source pano; returns (run_dir, scene, out_dir)."""
     d = tmp_path / "run"
     scene = make_scene(nt=nt, npi=npi, ground_spacing=1.0)
@@ -562,13 +651,16 @@ def test_fidelity_deterministic(tmp_path):
     assert a == b
 
 
-def test_fidelity_source_pano_priority(tmp_path):
-    """s1 clean plate wins over s0 ingest; missing both raises."""
+def test_fidelity_requires_clean_plate(tmp_path):
+    """The s1 clean plate is REQUIRED: an s0 ingest master alone must raise
+    (a complete run always writes pano_clean.png; a silent s0 fallback would
+    score fidelity against the UNCLEANED pano on broken runs)."""
     d = tmp_path / "run"
     with pytest.raises(FileNotFoundError):
         fidelity._source_pano_path(d)
     make_source_pano(d, kind="ingest")
-    assert fidelity._source_pano_path(d).name == "pano.png"
+    with pytest.raises(FileNotFoundError):
+        fidelity._source_pano_path(d)
     make_source_pano(d, kind="clean")
     assert fidelity._source_pano_path(d).name == "pano_clean.png"
 
@@ -648,7 +740,7 @@ def test_stage_missing_s6_raises(tmp_path):
 
 def test_stage_double_run_byte_identical(tmp_path):
     """Same scene bytes + params => byte-identical verdicts, renders and
-    receipt across two independent stage runs (tiny scene to keep the 2x28
+    receipt across two independent stage runs (tiny scene to keep the 2x35
     detector calls cheap)."""
     scene = make_scene(nt=24, npi=12, ground_spacing=1.0)
     params = stage_params(px=64)

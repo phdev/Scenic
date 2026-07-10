@@ -2,6 +2,7 @@
 stage-by-stage if not)."""
 from __future__ import annotations
 
+import itertools
 import sys
 from pathlib import Path
 
@@ -9,6 +10,25 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from scenic import hashing, manifest  # noqa: E402
+
+# Receipt fields diffed per stage when manifests diverge. inputs/outputs get
+# per-key hash reporting; the rest are compared as canonical JSON.
+_SCALAR_FIELDS = ("params_used", "params_hash", "weights", "gates", "notes", "code")
+
+
+def _diff_stage(ra: dict, rb: dict) -> None:
+    print(f"  stage {ra['stage']} diverges:")
+    for kind in ("inputs", "outputs"):
+        for k in sorted(set(ra[kind]) | set(rb[kind])):
+            va = ra[kind].get(k, {}).get("sha256")
+            vb = rb[kind].get(k, {}).get("sha256")
+            if va != vb:
+                print(f"    {kind}.{k}: {va} != {vb}")
+    for field in _SCALAR_FIELDS:
+        if hashing.canonical_json(ra.get(field)) != hashing.canonical_json(
+            rb.get(field)
+        ):
+            print(f"    {field} differs")
 
 
 def main(a: str, b: str) -> int:
@@ -20,20 +40,18 @@ def main(a: str, b: str) -> int:
     print(f"DETERMINISM FAILED: {ha} != {hb}")
     ma = hashing.read_json(Path(a) / "manifest.json")
     mb = hashing.read_json(Path(b) / "manifest.json")
-    for ra, rb in zip(ma["stages"], mb["stages"]):
+    if len(ma["stages"]) != len(mb["stages"]):
+        print(
+            f"  stage count differs: {len(ma['stages'])} != {len(mb['stages'])}"
+        )
+    for ra, rb in itertools.zip_longest(ma["stages"], mb["stages"]):
+        if ra is None or rb is None:
+            present = ra or rb
+            print(f"  stage {present['stage']} present in only one run")
+            continue
         if hashing.sha256_json(ra) == hashing.sha256_json(rb):
             continue
-        print(f"  stage {ra['stage']} diverges:")
-        for kind in ("inputs", "outputs"):
-            for k in sorted(set(ra[kind]) | set(rb[kind])):
-                va = ra[kind].get(k, {}).get("sha256")
-                vb = rb[kind].get(k, {}).get("sha256")
-                if va != vb:
-                    print(f"    {kind}.{k}: {va} != {vb}")
-        if ra.get("notes") != rb.get("notes"):
-            print("    notes differ")
-        if ra.get("gates") != rb.get("gates"):
-            print("    gates differ")
+        _diff_stage(ra, rb)
     return 1
 
 

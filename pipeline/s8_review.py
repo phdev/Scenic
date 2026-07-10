@@ -9,8 +9,12 @@ v2 QUALITY PASS deltas (authoritative, see docs/CONTRACTS.md):
 - Layer toggle gallery: surfaces the s7 layer renders
   `center_yaw{NNN}_layer_{fg,bg,shell}.png` as an inline base64 gallery with a
   small JS fg/bg/shell toggle (no network). Missing renders -> placeholder.
-- Keeps the 4-view this-vs-accepted grid (reuses s7's `center_yaw{NNN}.png`
-  renders byte-for-byte when present, else renders scene.ply).
+- Keeps the 4-view this-vs-accepted grid; the 4 thumbs are ALWAYS rendered
+  from scene.ply via the rasterizer. s7's renders dir is never reused for
+  thumbs: no current s7 output matches the standard view names (hole writes
+  the magenta-dyed `center_yawNNN_magenta.png`, people writes
+  `center_yawNNN_normal.png`), so any `center_yawNNN.png` there is stale
+  debris that must not become the shipped thumbnail.
 - SOG quant: reports per-profile ply_bytes vs sog_bytes ratio from
   compress.json. A python `.sog` decoder does not exist in-repo (splat-transform
   is a node subprocess whose WebP round-trip is not determinism-guaranteed and
@@ -34,6 +38,15 @@ Outputs:
 'Last accepted' = <run_dir>/../_accepted (a sibling run dir promoted by
 external tooling). Comparison requires its s8_review/out/review.json plus all
 four thumbs; anything less -> compared_to_accepted=false + placeholders.
+
+Receipt inputs record EVERY file whose bytes end up embedded in the hashed
+index.html: the s6 scene/sog/compress.json, all six verdicts, each EXISTING
+s7 layer render (key `layer_<yaw>_<layer>`, run-relative path so the manifest
+can match it against s7's recorded output hash), and — when
+compared_to_accepted — the five accepted-baseline files (keys
+`accepted_review` + `accepted_thumb_<yaw>`; they live outside the run dir so
+they hash as external/<name>). Promoting a new baseline therefore shows up as
+a recorded input change, never as unattributable output divergence.
 
 Runs after s7 and before the manifest build: reads only prior stages' out/
 dirs, never manifest.json. Pure numpy; no torch, no RNG.
@@ -101,33 +114,18 @@ _TOGGLE_JS = (
 # ------------------------------------------------------------------ helpers
 
 
-def _find_s7_render(renders_dir: Path, yaw_deg: int) -> Path | None:
-    """Recognize an s7 render of the standard center-pose view for yaw_deg.
-
-    Fixed candidate-name order -> deterministic. Unrecognized naming simply
-    falls back to rendering (never wrong, only slower)."""
-    if not renders_dir.is_dir():
-        return None
-    for name in (
-        f"center_yaw{yaw_deg:03d}.png",
-        f"center_yaw{yaw_deg}.png",
-        f"yaw{yaw_deg:03d}.png",
-        f"yaw{yaw_deg}.png",
-        f"yaw_{yaw_deg}.png",
-    ):
-        p = renders_dir / name
-        if p.exists():
-            return p
-    return None
-
-
 def _layer_render_name(yaw_deg: int, layer: str) -> str:
     return f"center_yaw{yaw_deg:03d}_layer_{layer}.png"
 
 
+def _accepted_out(run_dir: Path) -> Path:
+    """The last-accepted baseline's s8 out dir (runs/_accepted sibling)."""
+    return run_dir.parent / "_accepted" / STAGE / "out"
+
+
 def _load_accepted(run_dir: Path) -> tuple[dict[int, bytes], bool]:
     """Thumbs of the last accepted run (runs/_accepted sibling), if complete."""
-    acc_out = run_dir.parent / "_accepted" / STAGE / "out"
+    acc_out = _accepted_out(run_dir)
     review_path = acc_out / "review.json"
     thumb_paths = {y: acc_out / "thumbs" / f"{y}.png" for y in YAWS_DEG}
     if not review_path.exists() or not all(
@@ -374,50 +372,46 @@ def run(run_dir: Path, params: dict, ctx: Ctx) -> None:
 
     renders_dir = run_dir / "s7_gates" / "out" / "renders"
 
-    # -- 4 standard views: reuse s7 renders byte-for-byte, else render ------
+    # -- 4 standard views: ALWAYS rendered from scene.ply (never reused from
+    #    s7's renders dir — anything matching the standard view names there is
+    #    stale debris and must not become the shipped thumbnail)
     thumbs_dir = out / "thumbs"
     thumbs_dir.mkdir(parents=True, exist_ok=True)
-    splats = None  # lazy: only read the ply if we actually render
+    splats = plyio.read_splats(scene_ply)
     this_png: dict[int, bytes] = {}
     poses: list[dict] = []
     for yaw in YAWS_DEG:
         thumb = thumbs_dir / f"{yaw}.png"
-        src = _find_s7_render(renders_dir, yaw)
-        if src is not None:
-            data = src.read_bytes()
-            thumb.write_bytes(data)
-            source = "s7_renders"
-        else:
-            if splats is None:
-                splats = plyio.read_splats(scene_ply)
-            res = rasterizer.render(
-                splats,
-                rasterizer.Camera(
-                    pos=np.zeros(3, dtype=np.float64),
-                    yaw=math.radians(float(yaw)),
-                    pitch=0.0,
-                ),
-                px,
-                px,
-                fov_deg,
-            )
-            imageio.save_png(thumb, res["rgb"])
-            data = thumb.read_bytes()
-            source = "rendered"
-        this_png[yaw] = data
+        res = rasterizer.render(
+            splats,
+            rasterizer.Camera(
+                pos=np.zeros(3, dtype=np.float64),
+                yaw=math.radians(float(yaw)),
+                pitch=0.0,
+            ),
+            px,
+            px,
+            fov_deg,
+        )
+        imageio.save_png(thumb, res["rgb"])
+        this_png[yaw] = thumb.read_bytes()
         poses.append(
             {
                 "yaw_deg": yaw,
                 "pitch_deg": 0,
                 "fov_deg": fov_deg,
                 "px": px,
-                "source": source,
+                # kept for schema stability; always "rendered" now
+                "source": "rendered",
             }
         )
 
     # -- layer toggle gallery (surface s7 layer renders; placeholder if not) -
+    # every layer render actually read gets recorded as a receipt input: its
+    # bytes are embedded in the hashed index.html
     layer_gallery: list[tuple[int, dict[str, str | None]]] = []
     layer_filenames: list[str] = []
+    layer_inputs: dict[str, Path] = {}
     for yaw in YAWS_DEG:
         uris: dict[str, str | None] = {}
         for layer in LAYERS:
@@ -426,6 +420,7 @@ def run(run_dir: Path, params: dict, ctx: Ctx) -> None:
             if lpath.exists():
                 uris[layer] = _data_uri(lpath.read_bytes())
                 layer_filenames.append(fname)
+                layer_inputs[f"layer_{yaw}_{layer}"] = lpath
             else:
                 uris[layer] = None
         layer_gallery.append((yaw, uris))
@@ -493,6 +488,15 @@ def run(run_dir: Path, params: dict, ctx: Ctx) -> None:
     }
     for g in GATES:
         inputs[f"verdict_{g}"] = vdir / f"{g}.json"
+    inputs.update(layer_inputs)
+    if compared:
+        # the baseline bytes are embedded in index.html, so a baseline
+        # promotion must show up as a recorded input change (they sit outside
+        # the run dir -> hashed as external/<name>)
+        acc_out = _accepted_out(run_dir)
+        inputs["accepted_review"] = acc_out / "review.json"
+        for yaw in YAWS_DEG:
+            inputs[f"accepted_thumb_{yaw}"] = acc_out / "thumbs" / f"{yaw}.png"
     outputs: dict[str, Path] = {
         "index": index_path,
         "review": review_path,

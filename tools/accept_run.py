@@ -7,14 +7,17 @@ manifest.json and params.snapshot.yaml for provenance, plus accepted.json
 timestamps, no absolute paths.
 
 Integrity: the manifest is RE-DERIVED from the stage receipts via
-scenic.manifest.build before promoting — receipts are the source of truth,
-so an incomplete receipt chain refuses and a hand-edited manifest.json is
-overwritten with what the receipts actually say. A run with failing gates
+scenic.manifest.build(verify_disk=True) before promoting — receipts are the
+source of truth, so an incomplete or incoherent receipt chain refuses, a
+hand-edited manifest.json is overwritten with what the receipts actually
+say, and every recorded output is re-hashed against the file on disk
+(tampered or stale artifacts refuse). A run with failing gates
 (shippable=false) is refused unless --allow-failed-gates; gates record
 verdicts, humans decide.
 
-The swap is staged: the snapshot is built in _accepted.incoming, then the
-old _accepted is removed and the staging dir renamed into place.
+The swap is staged: the snapshot is built in a per-process
+_accepted.incoming.<pid> dir (removed on failure), then the old _accepted
+is removed and the staging dir renamed into place.
 
 Usage: uv run python tools/accept_run.py runs/<name> [--allow-failed-gates]
        (or: make accept RUN=runs/<name> [FORCE=1])
@@ -22,6 +25,7 @@ Usage: uv run python tools/accept_run.py runs/<name> [--allow-failed-gates]
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -32,7 +36,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from scenic import manifest, schema  # noqa: E402
 
 ACCEPTED_NAME = "_accepted"
-STAGING_NAME = "_accepted.incoming"
+STAGING_PREFIX = "_accepted.incoming"
 THUMB_YAWS = (0, 90, 180, 270)  # s8_review's standard views
 
 
@@ -41,8 +45,8 @@ def check_run(run_dir: Path) -> dict:
     if not run_dir.is_dir():
         raise SystemExit(f"not a run dir: {run_dir}")
     try:
-        man = manifest.build(run_dir)
-    except RuntimeError as e:  # incomplete receipt chain
+        man = manifest.build(run_dir, verify_disk=True)
+    except RuntimeError as e:  # incomplete or incoherent receipt chain
         raise SystemExit(f"refusing to accept {run_dir.name}: {e}") from e
 
     s8_out = run_dir / "s8_review" / "out"
@@ -63,29 +67,33 @@ def promote(run_dir: Path, man: dict) -> Path:
     """Stage the slim baseline snapshot, then swap it into _accepted."""
     parent = run_dir.parent
     dest = parent / ACCEPTED_NAME
-    staging = parent / STAGING_NAME
-    if staging.exists():
-        shutil.rmtree(staging)
-    staging.mkdir(parents=True)
+    staging = parent / f"{STAGING_PREFIX}.{os.getpid()}"
+    try:
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True)
 
-    shutil.copytree(run_dir / "s8_review", staging / "s8_review")
-    shutil.copyfile(run_dir / "manifest.json", staging / "manifest.json")
-    snap = run_dir / "params.snapshot.yaml"
-    if snap.exists():
-        shutil.copyfile(snap, staging / "params.snapshot.yaml")
+        shutil.copytree(run_dir / "s8_review", staging / "s8_review")
+        shutil.copyfile(run_dir / "manifest.json", staging / "manifest.json")
+        snap = run_dir / "params.snapshot.yaml"
+        if snap.exists():
+            shutil.copyfile(snap, staging / "params.snapshot.yaml")
 
-    record = {
-        "schema": "scenic-accepted-v1",
-        "source_run": run_dir.name,
-        "manifest_hash": manifest.manifest_hash(run_dir),
-        "shippable": man["shippable"],
-        "gate_summary": man["gate_summary"],
-    }
-    schema.write_validated(staging / "accepted.json", record, "accepted")
+        record = {
+            "schema": "scenic-accepted-v1",
+            "source_run": run_dir.name,
+            "manifest_hash": manifest.manifest_hash(run_dir),
+            "shippable": man["shippable"],
+            "gate_summary": man["gate_summary"],
+        }
+        schema.write_validated(staging / "accepted.json", record, "accepted")
 
-    if dest.exists():
-        shutil.rmtree(dest)
-    staging.rename(dest)
+        if dest.exists():
+            shutil.rmtree(dest)
+        staging.rename(dest)
+    finally:
+        if staging.exists():  # failure before the rename — clean up
+            shutil.rmtree(staging)
     return dest
 
 
@@ -100,8 +108,10 @@ def main(argv: list[str] | None = None) -> int:
         help="promote even if shippable=false (failing gates)",
     )
     args = ap.parse_args(argv)
-    run_dir = args.run_dir
-    if run_dir.name in (ACCEPTED_NAME, STAGING_NAME):
+    # Resolve first: trailing '/', '..' segments, and symlinks otherwise
+    # yield a misleading .name and can place staging inside the run itself.
+    run_dir = args.run_dir.resolve()
+    if run_dir.name == ACCEPTED_NAME or run_dir.name.startswith(STAGING_PREFIX):
         raise SystemExit("refusing to promote the baseline onto itself")
 
     man = check_run(run_dir)

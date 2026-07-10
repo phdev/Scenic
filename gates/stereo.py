@@ -9,17 +9,24 @@ the center pose for each of the 4 yaws and check three failure modes:
    argmin + parabolic subpixel refine. |dy*| must be <=
    s7.stereo_vdisp_max_px in every yaw. (Flat-cost guard: if the costs are
    indistinguishable there is no signal, dy* = 0.)
-2. near limit — min finite depth over the central half (both axes) of BOTH
-   eyes' depth maps must be >= s7.stereo_near_depth_min_m. Views with no
-   finite central depth contribute the sentinel DEPTH_SENTINEL_M (receipts
-   forbid Inf).
+2. near limit — min finite depth over the FULL frame minus a fixed 2-px
+   border margin of BOTH eyes' depth maps must be >=
+   s7.stereo_near_depth_min_m. Views with no finite depth contribute the
+   sentinel DEPTH_SENTINEL_M (receipts forbid Inf). Beyond the 4 yaws, two
+   near-limit-ONLY eye pairs at (yaw 0, pitch -90) and (yaw 0, pitch +90)
+   close the polar blind wedges; the eye offset stays horizontal (IPD is a
+   yaw-frame offset, rotation_yaw_pitch(yaw, 0) @ [1,0,0]). Pitched pairs
+   contribute ONLY to min_depth_m — vdisp and order stay on the pitch-0
+   yaws, where the horizontal-disparity geometry they assume holds.
 3. depth order — per-pixel horizontal disparity from geometry d = f*ipd/zL
    (f in px); warp the R depth map by d (uR = uL - d, nearest pixel) and
    count the fraction of finite L/R pairs with |zL - zR_warped| / zL <
    REL_DEPTH_TOL. Must be >= s7.stereo_order_min_frac in every yaw (views
    with no finite pairs pass vacuously, n recorded in details).
 
-PASS iff all three hold. Diagnostics: yaw-0 L/R renders in outdir/renders/.
+PASS iff all three hold. details.per_yaw carries the 4 yaw entries plus the
+2 pitched near-only entries (flagged near_only, with a pitch_deg field).
+Diagnostics: yaw-0 L/R renders in outdir/renders/.
 """
 from __future__ import annotations
 
@@ -35,6 +42,11 @@ from gates import YAWS_DEG, render_view, save_render
 REL_DEPTH_TOL = 0.2       # depth-order relative consistency tolerance
 DEPTH_SENTINEL_M = 1.0e9  # stands in for "no finite depth" (no Inf in JSON)
 _FLAT_COST_EPS = 1e-12    # below this cost spread, there is no vdisp signal
+_BORDER_MARGIN_PX = 2     # near-limit frame margin (edge-clipped footprints)
+
+# Near-limit-only eye pairs (yaw_deg, pitch_deg): straight down + straight
+# up, closing the |pitch| blind wedges of the pitch-0 yaw ring.
+NEAR_ONLY_VIEWS = ((0.0, -90.0), (0.0, 90.0))
 
 
 def _grad_mag(rgb: np.ndarray) -> np.ndarray:
@@ -68,10 +80,12 @@ def _vertical_disparity_px(gl: np.ndarray, gr: np.ndarray) -> float:
     return dy_star
 
 
-def _central_min_depth(depth: np.ndarray) -> float:
-    """Min finite depth over the central half (both axes); sentinel if none."""
-    h, w = depth.shape
-    win = depth[h // 4 : h - h // 4, w // 4 : w - w // 4]
+def _frame_min_depth(depth: np.ndarray) -> float:
+    """Min finite depth over the full frame minus a fixed 2-px border margin
+    (partial splat footprints clipped at the frame edge carry unreliable
+    expected depth); sentinel if no finite depth survives."""
+    m = _BORDER_MARGIN_PX
+    win = depth[m:-m, m:-m]
     finite = win[np.isfinite(win)]
     if finite.size == 0:
         return DEPTH_SENTINEL_M
@@ -128,8 +142,8 @@ def run_gate(splats: SplatData, params: dict, outdir: Path | str) -> dict:
             _grad_mag(left_eye["rgb"]), _grad_mag(right_eye["rgb"])
         )
         min_depth = min(
-            _central_min_depth(left_eye["depth"]),
-            _central_min_depth(right_eye["depth"]),
+            _frame_min_depth(left_eye["depth"]),
+            _frame_min_depth(right_eye["depth"]),
         )
         order_frac, n_order = _order_consistency(
             left_eye["depth"], right_eye["depth"], f_px, ipd
@@ -137,16 +151,40 @@ def run_gate(splats: SplatData, params: dict, outdir: Path | str) -> dict:
         per_yaw.append(
             {
                 "yaw_deg": float(yaw),
+                "pitch_deg": 0.0,
                 "vdisp_px": float(vdisp),
                 "min_depth_m": float(min_depth),
                 "order_frac": float(order_frac),
                 "n_order_px": int(n_order),
+                "near_only": False,
             }
         )
 
-    vdisp_worst = max(abs(v["vdisp_px"]) for v in per_yaw)
+    # Polar near-limit-only pairs: the eye offset stays horizontal (IPD is a
+    # yaw-frame offset), only min_depth_m is measured — vdisp and the
+    # horizontal-disparity order model do not apply to pitched cameras.
+    for yaw, pitch in NEAR_ONLY_VIEWS:
+        right = rotation_yaw_pitch(float(np.deg2rad(yaw)), 0.0) @ np.array(
+            [1.0, 0.0, 0.0]
+        )
+        left_eye = render_view(splats, params, -0.5 * ipd * right, yaw, pitch)
+        right_eye = render_view(splats, params, 0.5 * ipd * right, yaw, pitch)
+        min_depth = min(
+            _frame_min_depth(left_eye["depth"]),
+            _frame_min_depth(right_eye["depth"]),
+        )
+        per_yaw.append(
+            {
+                "yaw_deg": float(yaw),
+                "pitch_deg": float(pitch),
+                "min_depth_m": float(min_depth),
+                "near_only": True,
+            }
+        )
+
+    vdisp_worst = max(abs(v["vdisp_px"]) for v in per_yaw if not v["near_only"])
     min_depth_all = min(v["min_depth_m"] for v in per_yaw)
-    order_worst = min(v["order_frac"] for v in per_yaw)
+    order_worst = min(v["order_frac"] for v in per_yaw if not v["near_only"])
     passed = (
         vdisp_worst <= vdisp_max
         and min_depth_all >= near_min

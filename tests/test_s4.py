@@ -212,12 +212,17 @@ def test_sphere_receipt_written(sphere_run):
     rec = receipts.read_receipt(sphere_run, "s4_place")
     assert rec["stage"] == "s4_place"
     assert "splats" in rec["outputs"] and "splats_meta" in rec["outputs"]
-    for key in ["fg_rgb", "fg_depth", "bg_rgb", "bg_depth", "sky_mask", "layers"]:
-        assert key in rec["inputs"], key
+    # exactly what the stage consumed: fg_mask.png is NEVER read -> never claimed
+    assert set(rec["inputs"]) == {
+        "fg_rgb", "fg_depth", "bg_rgb", "bg_depth", "sky_mask", "layers",
+        "bg_mask",  # fixture writes one, so the stage loads + records it
+    }
     assert rec["notes"]["strides"]["base"] == 2
     assert rec["notes"]["stride_multiplier"] == 1.0
     assert rec["params_used"]["s4"]["base_stride"] == 2
     assert rec["params_used"]["min_content_distance_m"] == 6.0
+    # the effective placement density is part of the params fingerprint
+    assert rec["params_used"]["stride_multiplier"] == 1.0
     assert rec["notes"]["near_shell_px"] == 0
     assert rec["weights"] == []
 
@@ -345,6 +350,7 @@ def test_determinism_double_run_byte_identical(tmp_path):
 
 def test_stride_multiplier_reduces_counts(tmp_path):
     counts = {}
+    hashes = {}
     for mult in [1.0, 2.0]:
         d = tmp_path / f"m{int(mult)}" / "run"
         make_run(d, np.full((H, W), SPHERE_R, np.float32),
@@ -353,8 +359,24 @@ def test_stride_multiplier_reduces_counts(tmp_path):
         _, meta = _read(d)
         assert meta["stride_multiplier"] == mult
         counts[mult] = meta["count"]
+        rec = receipts.read_receipt(d, "s4_place")
+        assert rec["params_used"]["stride_multiplier"] == mult
+        hashes[mult] = rec["params_hash"]
     assert counts[2.0] > 0
     assert counts[2.0] < 0.5 * counts[1.0]
+    # materially different placements => different params fingerprints
+    assert hashes[1.0] != hashes[2.0]
+
+
+def test_fg_mask_never_consumed(tmp_path):
+    # s4 loads fg_rgb/fg_depth/bg_rgb/bg_depth/sky[/bg_mask] but never
+    # fg_mask.png: the stage must run without it and must not claim it.
+    d = tmp_path / "run"
+    make_run(d, np.full((H, W), SPHERE_R, np.float32))
+    (d / "s3_layers" / "out" / "fg_mask.png").unlink()
+    run_stage(d)
+    rec = receipts.read_receipt(d, "s4_place")
+    assert "fg_mask" not in rec["inputs"]
 
 
 # ------------------------------------------------------------- room / bg clamp

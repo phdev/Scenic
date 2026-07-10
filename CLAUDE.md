@@ -15,10 +15,16 @@ layout, geometry conventions, receipt API, and determinism rules.
 - **Determinism is tested, not intended**: `make determinism-check` runs the
   pipeline twice and asserts bit-identical manifests. No timestamps, no
   absolute paths, no unseeded RNG, no wall-clock in any artifact or receipt.
+- **Receipts are checked, not trusted**: `manifest.build` refuses incomplete
+  AND incoherent chains (wrong stage dir, in-run input without a recorded
+  producer, producer/consumer hash mismatch from `--only` staleness);
+  `make accept` additionally re-hashes every recorded output on disk. The
+  harness clears each stage's `receipt.json` + `out/` before running it.
 - **S5 is reserved. No gsplat training/optimization in the ship path.**
 - Stages are single-owner modules communicating only via schema-validated
   on-disk artifacts. No network at stage runtime (weights pre-fetched +
-  hash-pinned in `weights/pins.json`).
+  hash-pinned in `weights/pins.json`; static import guard + a runtime
+  `socket.connect` audit hook enforce it).
 
 ## Commands
 
@@ -27,6 +33,9 @@ layout, geometry conventions, receipt API, and determinism rules.
 - `make fixtures` — generate synthetic test panos (sphere / room oracles)
 - `make run PANO=fixtures/test.jpg [OUT=runs/x]` — full pipeline
 - `make determinism-check` — the acceptance gate (double run, hash-equal)
+- `make accept RUN=runs/<name> [FORCE=1]` — promote a run to the
+  `runs/_accepted` baseline (refuses incoherent/tampered/unshippable runs;
+  FORCE=1 overrides the shippable check only, recorded honestly)
 - `make test` / `make license-guard`
 
 ## Layout
@@ -71,6 +80,10 @@ card-checked) slot in there. DA-V2 Base/Large are CC-BY-NC — forbidden.
   OPEN, weights never in the enforced tree, see weights/LICENSES.md).
 - **Layer forensics**: s7 renders fg/bg/shell-only origin views + per-layer
   counts & solid-angle; s8 surfaces them as toggles.
+- **Gate view matrix**: 7 poses × (4 yaws + straight-down) = 35 views for
+  hole/people (nadir blind cone closed); stereo near-limit is full-frame
+  (±45°/view → no azimuth wedges) + pitch ±90 near-only pairs; jitter gates
+  the worst of 5 center-pose view pairs.
 - **`make sweep`**: grid over placement params ranked by fidelity SSIM.
 
 The Machu Picchu vantage is the **adversarial** fixture: it correctly FAILs

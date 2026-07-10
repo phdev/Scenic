@@ -196,6 +196,29 @@ def test_normals_from_depth_constant_sphere_faces_camera():
     assert np.all(dot > 0.99)
 
 
+def test_normals_from_depth_wraps_longitude_seam():
+    """Regression (adversarial review): the x central differences must wrap
+    the equirect longitude axis, so columns 0 and w-1 get genuine computed
+    normals (they used to silently fall back to -dir despite valid depths).
+    Discriminating check: a smooth non-symmetric wrap-continuous field rolled
+    by half a width must yield the same normals once un-rolled."""
+    w, h = 64, 32
+    dirs = g.equirect_dirs(w, h)
+    lon, lat = g.equirect_lonlat(w, h)
+    depth = 2.0 + 0.4 * np.sin(lon) + 0.2 * np.cos(2 * lon + 0.7) + 0.3 * np.sin(lat)
+    n = g.normals_from_depth(depth, dirs)
+    assert np.allclose(np.linalg.norm(n, axis=-1), 1.0, atol=1e-6)
+    s = w // 2
+    n_roll = g.normals_from_depth(np.roll(depth, s, axis=1), np.roll(dirs, s, axis=1))
+    assert np.allclose(n, np.roll(n_roll, -s, axis=1), atol=1e-12)
+    # the seam columns really are computed normals, not the -dir fallback:
+    # the field's lon-gradient at lon=+/-pi is ~0.4|cos(pi)| != 0, so the
+    # true surface tilts away from the ray there.
+    band = slice(h // 4, 3 * h // 4)
+    assert np.abs(n[band, 0] + dirs[band, 0]).max() > 1e-2
+    assert np.abs(n[band, -1] + dirs[band, -1]).max() > 1e-2
+
+
 def test_normals_from_depth_invalid_depth_falls_back_to_minus_dir():
     w, h = 16, 8
     dirs = g.equirect_dirs(w, h)

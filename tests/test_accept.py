@@ -51,17 +51,12 @@ def _verdict(gate: str, ok: bool) -> dict:
 def make_completed_run(d: Path, name: str, all_pass: bool = True) -> Path:
     """A run with a full receipt chain + the s8 baseline artifacts.
 
-    Fails the stereo gate when all_pass=False (shippable=false)."""
+    Fails the stereo gate when all_pass=False (shippable=false). The s8
+    receipt records index.html/review.json as outputs so accept's
+    verify_disk pass has real hashes to check."""
     run = d / name
     run.mkdir(parents=True)
     (run / "params.snapshot.yaml").write_text("seed: 0\n")
-    for stage in manifest.stage_order():
-        gates = []
-        if stage == "s7_gates":
-            gates = [_verdict(g, ok=(all_pass or g != "stereo")) for g in GATES]
-        receipts.write_receipt(
-            run, stage, inputs={}, outputs={}, params_used={}, gates=gates
-        )
     out = run / "s8_review" / "out"
     (out / "thumbs").mkdir(parents=True)
     (out / "index.html").write_text(f"<html><body>{name}</body></html>\n")
@@ -74,6 +69,16 @@ def make_completed_run(d: Path, name: str, all_pass: bool = True) -> Path:
     rgb[..., 0] = sum(name.encode()) % 256  # distinct thumbs per run name
     for y in YAWS:
         imageio.save_png(out / "thumbs" / f"{y}.png", rgb)
+    for stage in manifest.stage_order():
+        gates = []
+        outputs: dict = {}
+        if stage == "s7_gates":
+            gates = [_verdict(g, ok=(all_pass or g != "stereo")) for g in GATES]
+        if stage == "s8_review":
+            outputs = {"index": out / "index.html", "review": out / "review.json"}
+        receipts.write_receipt(
+            run, stage, inputs={}, outputs=outputs, params_used={}, gates=gates
+        )
     # a heavyweight artifact that must NOT be promoted (slim baseline)
     s4 = run / "s4_place" / "out"
     s4.mkdir(parents=True)
@@ -186,3 +191,25 @@ def test_refuses_self_promotion(tmp_path):
     accept_run.main([str(run)])
     with pytest.raises(SystemExit, match="onto itself"):
         accept_run.main([str(tmp_path / "_accepted")])
+
+
+def test_refuses_tampered_artifact(tmp_path):
+    """verify_disk: a recorded output modified after the run refuses."""
+    run = make_completed_run(tmp_path, "a")
+    (run / "s8_review/out/index.html").write_text("<html>tampered</html>\n")
+    with pytest.raises(SystemExit, match="does not match the file on disk"):
+        accept_run.main([str(run)])
+    assert not (tmp_path / "_accepted").exists()
+
+
+def test_trailing_slash_and_dotdot_resolved(tmp_path):
+    run = make_completed_run(tmp_path, "a")
+    assert accept_run.main([str(run) + "/"]) == 0
+    rec = schema.read_validated(tmp_path / "_accepted/accepted.json", "accepted")
+    assert rec["source_run"] == "a"
+    # '..' resolves away instead of naming staging inside the run: the
+    # resolved dir (tmp_path) has no receipts, so this refuses cleanly
+    # instead of recursively copytree-ing into the run itself.
+    with pytest.raises(SystemExit, match="incomplete receipt chain"):
+        accept_run.main([str(run) + "/.."])
+    assert not any(p.name.startswith("_accepted.incoming") for p in run.iterdir())

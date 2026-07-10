@@ -11,7 +11,10 @@ inside the surviving band.
 Reads (all at depth resolution; pano is resampled bilinearly to it):
   s2b_scale/out/depth_m.npy     float32 HxW radial metric depth, inf invalid
   s2_depth/out/sky_mask.png     bool mask
-  s1_cleanplate/out/pano_clean.png if present else s0_ingest/out/pano.png
+  s1_cleanplate/out/pano_clean.png  REQUIRED — s1 always writes it in a
+                                complete run, so a missing file means a broken
+                                run dir and raises (never a silent fallback to
+                                the un-cleaned s0 pano)
 
 Writes: fg_rgb.png fg_depth.npy fg_mask.png bg_rgb.png bg_depth.npy
 bg_mask.png layers.json (+ receipt with the bg_solid_angle gate). Pure numpy,
@@ -113,11 +116,11 @@ def run(run_dir: Path, params: dict, ctx: Ctx) -> None:
 
     depth_path = run_dir / "s2b_scale" / "out" / "depth_m.npy"
     sky_path = run_dir / "s2_depth" / "out" / "sky_mask.png"
-    clean_path = run_dir / "s1_cleanplate" / "out" / "pano_clean.png"
-    if clean_path.exists():
-        pano_path, pano_source = clean_path, "s1_cleanplate"
-    else:
-        pano_path, pano_source = run_dir / "s0_ingest" / "out" / "pano.png", "s0_ingest"
+    pano_path = run_dir / "s1_cleanplate" / "out" / "pano_clean.png"
+    if not pano_path.exists():
+        # s1 ALWAYS writes pano_clean.png in a complete run; falling back to
+        # the un-cleaned s0 pano would only mask a broken run dir.
+        raise FileNotFoundError(f"missing s1 output {pano_path}")
 
     depth = imageio.load_npy(depth_path).astype(np.float64)
     if depth.ndim != 2:
@@ -295,5 +298,5 @@ def run(run_dir: Path, params: dict, ctx: Ctx) -> None:
         },
         weights_used=[],
         gates=[gate],
-        notes={"pano_source": pano_source},
+        notes={"pano_source": "s1_cleanplate"},
     )

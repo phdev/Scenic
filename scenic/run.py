@@ -27,12 +27,21 @@ def run_pipeline(
     from pipeline.registry import STAGES, get_stage
 
     determinism.enforce()
+    determinism.block_network()  # no network at stage runtime, enforced
     p = params_mod.load(params_path)
     determinism.set_seed(p.get("seed", 0))
 
     out.mkdir(parents=True, exist_ok=True)
     snap = out / "params.snapshot.yaml"
-    shutil.copyfile(params_path, snap)
+    params_bytes = Path(params_path).read_bytes()
+    if only and snap.exists() and snap.read_bytes() != params_bytes:
+        # A single-stage re-run under different params would leave a stale
+        # mixed chain (manifest.build refuses those); fail loudly instead.
+        raise SystemExit(
+            f"--only {only}: params differ from {snap}; run the full "
+            "pipeline, or restore the params that produced this run"
+        )
+    snap.write_bytes(params_bytes)
 
     sidecar = pano.with_suffix(pano.suffix + ".license.json")
     ctx = Ctx(
@@ -48,12 +57,24 @@ def run_pipeline(
         if name not in names:
             raise SystemExit(f"unknown stage {name}; known: {names}")
         stage = get_stage(name)
+        # Clear prior state so the receipt provably comes from THIS
+        # invocation and out/ holds only files this execution wrote.
+        rec = out / name / "receipt.json"
+        if rec.exists():
+            rec.unlink()
+        stage_out = out / name / "out"
+        if stage_out.exists():
+            shutil.rmtree(stage_out)
         print(f"[scenic] {name} ...", flush=True)
         stage.run(out, p, ctx)
-        rec = out / name / "receipt.json"
         if not rec.exists():
             raise RuntimeError(f"stage {name} did not write a receipt")
     if only:
+        # Any pre-existing manifest now aggregates a stale mix; remove it.
+        # manifest.build (full run / accept) re-derives and checks coherence.
+        stale_manifest = out / "manifest.json"
+        if stale_manifest.exists():
+            stale_manifest.unlink()
         return None
     m = manifest.build(out)
     h = manifest.manifest_hash(out)

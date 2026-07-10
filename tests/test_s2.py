@@ -18,7 +18,7 @@ from scenic import determinism
 
 determinism.set_env()  # before any torch import
 
-from scenic import hashing, imageio, params as params_mod, receipts, schema
+from scenic import geometry, hashing, imageio, params as params_mod, receipts, schema
 from scenic.stage import Ctx
 from pipeline import s2_depth
 
@@ -146,6 +146,67 @@ def test_sky_mask_helper_flags_far_smooth_upper():
     assert s2_depth._sky_mask(flat, np.log(flat), 90.0, 0.02, 0.0).sum() == 0
 
 
+def _box_ref(img: np.ndarray, r: int, wrap_x: bool) -> np.ndarray:
+    """Brute-force (2r+1)^2 window sum: y clips, x clips or wraps."""
+    h, w = img.shape
+    out = np.zeros_like(img)
+    for i in range(h):
+        rows = np.arange(max(0, i - r), min(h, i + r + 1))
+        for j in range(w):
+            if wrap_x:
+                cols = np.arange(j - r, j + r + 1) % w
+            else:
+                cols = np.arange(max(0, j - r), min(w, j + r + 1))
+            out[i, j] = img[np.ix_(rows, cols)].sum()
+    return out
+
+
+def test_box_matches_bruteforce_clip_and_wrap():
+    """The cumsum box filter equals the brute-force window sum in BOTH modes;
+    wrap_x only differs from clip within r columns of the lon seam."""
+    r = 3
+    h, w = 12, 16
+    img = np.sin(np.arange(h * w, dtype=np.float64) * 0.7).reshape(h, w)
+    clip = s2_depth._box(img, r)
+    wrap = s2_depth._box(img, r, wrap_x=True)
+    assert np.allclose(clip, _box_ref(img, r, wrap_x=False), atol=1e-12)
+    assert np.allclose(wrap, _box_ref(img, r, wrap_x=True), atol=1e-12)
+    assert np.allclose(clip[:, r : w - r], wrap[:, r : w - r], atol=1e-12)
+    # wrap_x window count is exactly 2r+1 in x everywhere (ones image: each
+    # row is constant across x, equal to the clipped interior count).
+    ones = np.ones((h, w), dtype=np.float64)
+    n = s2_depth._box(ones, r, wrap_x=True)
+    assert np.allclose(n, s2_depth._box(ones, r)[:, r : r + 1], atol=1e-12)
+
+
+def test_guided_filter_wraps_longitude_seam():
+    """Regression (adversarial review): clipped x windows estimated the local
+    linear model one-sided at the lon=+/-pi meridian, creasing the filtered
+    log depth (~6-8x the interior step on a wrap-continuous field). The filter
+    must treat the seam like any interior column pair AND be shift-equivariant
+    under a half-width roll."""
+    w, h = 512, 256
+    lon, lat = geometry.equirect_lonlat(w, h)
+    src = (
+        0.5 * np.sin(2 * lon)
+        + 0.3 * np.cos(2 * lat)
+        + 0.1 * np.sin(5 * lon + 3 * lat)
+    )
+    guide = 0.6 * np.cos(3 * lon) + 0.4 * np.sin(lat) + 0.2 * np.cos(lon - 2 * lat)
+    q = s2_depth._guided_filter(guide, src, r=8, eps=1e-4)
+    seam_step = float(np.abs(q[:, 0] - q[:, -1]).max())
+    interior_step = float(np.abs(np.diff(q, axis=1)).max())
+    assert seam_step <= 2.0 * interior_step, (seam_step, interior_step)
+    # shift-equivariance across the seam: roll the inputs by w//2 columns,
+    # filter, un-roll — must reproduce the direct result (float tolerance:
+    # cumsum order differs on the rolled grid).
+    s = w // 2
+    q_roll = s2_depth._guided_filter(
+        np.roll(guide, s, axis=1), np.roll(src, s, axis=1), r=8, eps=1e-4
+    )
+    assert np.allclose(q, np.roll(q_roll, -s, axis=1), atol=1e-8)
+
+
 def test_global_solve_no_overlap_is_identity():
     """A face with no overlaps at all is held at identity by the Tikhonov pull;
     the solver stays finite and never raises."""
@@ -196,6 +257,11 @@ def _run_stage(run_dir: Path) -> None:
     s0_out.mkdir(parents=True)
     pano_path = s0_out / "pano.png"
     imageio.save_png(pano_path, _make_pano())
+    # s1 passthrough as in a complete run: pano_clean.png is a byte-copy of
+    # the master (s2 REQUIRES the cleanplate, no s0 fallback).
+    s1_out = run_dir / "s1_cleanplate" / "out"
+    s1_out.mkdir(parents=True)
+    (s1_out / "pano_clean.png").write_bytes(pano_path.read_bytes())
     p = params_mod.load(REPO / "params.yaml")
     determinism.enforce()
     determinism.set_seed(p.get("seed", 0))
@@ -292,7 +358,7 @@ def test_receipt_valid(runs):
     rec = receipts.read_receipt(run_dir, "s2_depth")
     assert rec["stage"] == "s2_depth"
     assert set(rec["outputs"]) == {"depth_rel", "sky_mask", "depth_meta"}
-    assert list(rec["inputs"]) == ["pano"]  # s0 fallback path in this fixture
+    assert list(rec["inputs"]) == ["pano_clean"]  # the required s1 cleanplate
     assert [w["key"] for w in rec["weights"]] == ["depth_anything_v2_small"]
     assert set(rec["params_used"]) == {"resolutions", "faces", "s2"}
     assert "overlap_residual_log" in rec["notes"]
@@ -310,15 +376,16 @@ def test_determinism_bit_identical(runs):
         assert h1 == h2, f"{rel} differs across identical runs"
 
 
-def test_resolve_input_prefers_cleanplate(tmp_path):
+def test_resolve_input_requires_cleanplate(tmp_path):
     with pytest.raises(FileNotFoundError):
         s2_depth._resolve_input(tmp_path)
+    # an s0 pano alone must NOT be accepted: it only exists in a broken run
+    # dir, and depth must never be computed from the un-cleaned pano.
     s0 = tmp_path / "s0_ingest" / "out"
     s0.mkdir(parents=True)
     (s0 / "pano.png").write_bytes(b"x")
-    key, path = s2_depth._resolve_input(tmp_path)
-    assert key == "pano"
-    assert path == s0 / "pano.png"
+    with pytest.raises(FileNotFoundError):
+        s2_depth._resolve_input(tmp_path)
     s1 = tmp_path / "s1_cleanplate" / "out"
     s1.mkdir(parents=True)
     (s1 / "pano_clean.png").write_bytes(b"y")

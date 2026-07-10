@@ -135,18 +135,18 @@ def angular_pixel_size(h: int) -> float:
 
 def normals_from_depth(depth: np.ndarray, dirs: np.ndarray) -> np.ndarray:
     """Per-pixel unit normal from 3D point grid (central differences),
-    oriented to face the origin. Invalid depths propagate NaN-free: falls
-    back to -dir (facing camera)."""
+    oriented to face the origin. The x axis is equirect longitude and WRAPS
+    (columns 0 and w-1 difference across the seam); the y axis clamps (rows
+    0 and h-1 fall back). Invalid depths propagate NaN-free: falls back to
+    -dir (facing camera)."""
     finite = np.isfinite(depth)
     pts = dirs * np.where(finite, depth, 0.0)[..., None]
-    dx = np.zeros_like(pts)
+    dx = np.roll(pts, -1, axis=1) - np.roll(pts, 1, axis=1)
     dy = np.zeros_like(pts)
-    dx[:, 1:-1] = pts[:, 2:] - pts[:, :-2]
     dy[1:-1, :] = pts[2:, :] - pts[:-2, :]
     n = np.cross(dx, dy)
     norm = np.linalg.norm(n, axis=-1, keepdims=True)
-    finite_nbrs = np.ones_like(finite)
-    finite_nbrs[:, 1:-1] &= finite[:, 2:] & finite[:, :-2]
+    finite_nbrs = np.roll(finite, -1, axis=1) & np.roll(finite, 1, axis=1)
     finite_nbrs[1:-1, :] &= finite[2:, :] & finite[:-2, :]
     good = (norm[..., 0] > 1e-12) & finite & finite_nbrs
     n = np.where(good[..., None], n / np.maximum(norm, 1e-12), -dirs)

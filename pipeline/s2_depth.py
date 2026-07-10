@@ -2,7 +2,9 @@
 ONE global least-squares log-depth alignment (Huber IRLS) -> feathered
 equirect fusion -> edge-guided upsample -> sky mask.
 
-Input: s1_cleanplate/out/pano_clean.png when present, else s0_ingest/out/pano.png.
+Input: s1_cleanplate/out/pano_clean.png (REQUIRED — s1 always writes it in a
+complete run, passthrough byte-copies the master; a missing file means a broken
+run dir, never a licence to compute depth from the un-cleaned s0 pano).
 Outputs (out/): depth_rel.npy   float32 (out_h, out_w) radial relative depth,
                                 median-normalized, sky = +inf, never NaN
                 sky_mask.png    bool mask (255 = sky)
@@ -61,18 +63,18 @@ _MIN_DYN_RANGE = 2.0  # collapse guard: p99/p1 finite depth must exceed this
 
 
 def _resolve_input(run_dir: Path) -> tuple[str, Path]:
-    """Prefer the s1 cleanplate, fall back to the s0 master pano."""
+    """Require the s1 cleanplate. s1 ALWAYS writes pano_clean.png in a
+    complete run (passthrough byte-copies the master), so a missing file means
+    a broken run dir — silently falling back to the s0 pano would compute
+    depth from the UNCLEANED pano (people/watermark still in)."""
     run_dir = Path(run_dir)
     clean = run_dir / "s1_cleanplate" / "out" / "pano_clean.png"
-    if clean.exists():
-        return "pano_clean", clean
-    pano = run_dir / "s0_ingest" / "out" / "pano.png"
-    if pano.exists():
-        return "pano", pano
-    raise FileNotFoundError(
-        f"s2_depth: neither s1_cleanplate/out/pano_clean.png nor "
-        f"s0_ingest/out/pano.png exists under {run_dir}"
-    )
+    if not clean.exists():
+        raise FileNotFoundError(
+            f"s2_depth: s1_cleanplate/out/pano_clean.png missing under "
+            f"{run_dir} — run s1_cleanplate first (incomplete/broken run dir)"
+        )
+    return "pano_clean", clean
 
 
 def _face_list(params: dict) -> list[tuple[str, float, float, float]]:
@@ -214,8 +216,11 @@ def _face_weights(
     return w
 
 
-def _box(img: np.ndarray, r: int) -> np.ndarray:
-    """Box-filter sum over a (2r+1)^2 window clipped at borders, via cumsum."""
+def _box(img: np.ndarray, r: int, wrap_x: bool = False) -> np.ndarray:
+    """Box-filter sum over a (2r+1)^2 window, via cumsum. The y windows clip
+    at the top/bottom borders. With wrap_x=True the x axis is PERIODIC
+    (equirect longitude wraps): x sums run over a wrap-padded row so every x
+    window count is exactly 2r+1; with wrap_x=False the x windows clip too."""
     h, w = img.shape
     if min(h, w) < 2 * r + 2:
         raise ValueError(f"_box: image {h}x{w} too small for radius {r}")
@@ -224,6 +229,12 @@ def _box(img: np.ndarray, r: int) -> np.ndarray:
     t[: r + 1] = c[r : 2 * r + 1]
     t[r + 1 : h - r] = c[2 * r + 1 :] - c[: h - 2 * r - 1]
     t[h - r :] = c[h - 1 : h] - c[h - 2 * r - 1 : h - r - 1]
+    if wrap_x:
+        c = np.cumsum(np.pad(t, ((0, 0), (r, r)), mode="wrap"), axis=1)
+        out = np.empty_like(img)
+        out[:, 0] = c[:, 2 * r]
+        out[:, 1:] = c[:, 2 * r + 1 :] - c[:, : w - 1]
+        return out
     c = np.cumsum(t, axis=1)
     out = np.empty_like(img)
     out[:, : r + 1] = c[:, r : 2 * r + 1]
@@ -262,20 +273,23 @@ def _sky_mask(
 def _guided_filter(
     guide: np.ndarray, src: np.ndarray, r: int, eps: float
 ) -> np.ndarray:
-    """He et al. gray-guide guided filter, float64 cumsum box filters."""
+    """He et al. gray-guide guided filter, float64 cumsum box filters. Every
+    box wraps in x (equirect longitude is periodic; a clipped window would
+    estimate the local linear model one-sided at the lon=+/-pi meridian and
+    crease the filtered depth there) and clips in y (latitude clamps)."""
     guide = guide.astype(np.float64)
     src = src.astype(np.float64)
-    n = _box(np.ones_like(guide), r)
-    m_i = _box(guide, r) / n
-    m_p = _box(src, r) / n
-    m_ii = _box(guide * guide, r) / n
-    m_ip = _box(guide * src, r) / n
+    n = _box(np.ones_like(guide), r, wrap_x=True)
+    m_i = _box(guide, r, wrap_x=True) / n
+    m_p = _box(src, r, wrap_x=True) / n
+    m_ii = _box(guide * guide, r, wrap_x=True) / n
+    m_ip = _box(guide * src, r, wrap_x=True) / n
     var_i = m_ii - m_i * m_i
     cov_ip = m_ip - m_i * m_p
     a = cov_ip / (var_i + eps)
     b = m_p - a * m_i
-    m_a = _box(a, r) / n
-    m_b = _box(b, r) / n
+    m_a = _box(a, r, wrap_x=True) / n
+    m_b = _box(b, r, wrap_x=True) / n
     return m_a * guide + m_b
 
 

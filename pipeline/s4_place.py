@@ -40,9 +40,12 @@ radius = depth * angular_pixel_size(H) * class_stride * scale_multiplier,
 log_scales = [ln r, ln r, ln(r*flatten_ratio)] (disc flattened along n).
 
 run() accepts stride_multiplier (default 1.0); s6 re-invokes with larger
-values to enforce the splat cap. This stage never retries on cap overflow —
-it just records the count (and exceeds_cap) in splats_meta.json / the
-receipt notes. Pure numpy: no torch, no RNG, no wall-clock.
+values to enforce the splat cap. The multiplier is recorded in params_used
+(not just notes) so the receipt's params_hash fingerprints the EFFECTIVE
+placement parameters across cap-enforcement re-runs. This stage never
+retries on cap overflow — it just records the count (and exceeds_cap) in
+splats_meta.json / the receipt notes. Pure numpy: no torch, no RNG, no
+wall-clock.
 """
 from __future__ import annotations
 
@@ -321,7 +324,6 @@ def run(run_dir: Path, params: dict, ctx: Ctx, stride_multiplier: float = 1.0) -
     # -- inputs (hard errors on missing files / shape mismatches)
     fg_rgb_path = s3_out / "fg_rgb.png"
     fg_depth_path = s3_out / "fg_depth.npy"
-    fg_mask_path = s3_out / "fg_mask.png"
     bg_rgb_path = s3_out / "bg_rgb.png"
     bg_depth_path = s3_out / "bg_depth.npy"
     bg_mask_path = s3_out / "bg_mask.png"
@@ -505,7 +507,6 @@ def run(run_dir: Path, params: dict, ctx: Ctx, stride_multiplier: float = 1.0) -
     inputs = {
         "fg_rgb": fg_rgb_path,
         "fg_depth": fg_depth_path,
-        "fg_mask": fg_mask_path,
         "bg_rgb": bg_rgb_path,
         "bg_depth": bg_depth_path,
         "layers": layers_path,
@@ -523,6 +524,7 @@ def run(run_dir: Path, params: dict, ctx: Ctx, stride_multiplier: float = 1.0) -
             "splat_cap": splat_cap,
             "min_content_distance_m": min_content,
             "s3": {"edge_log_grad_min": edge_thr},
+            "stride_multiplier": mult,
         },
         weights_used=[],
         gates=[],

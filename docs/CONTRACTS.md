@@ -6,11 +6,17 @@ Deterministic pano → layered 3DGS pipeline. HARD INVARIANTS:
    artifacts. No timestamps, no absolute paths, no `set` iteration, no
    unseeded RNG, no wall-clock anywhere in artifacts or receipts. Torch: CPU
    only, single thread, `scenic.determinism.enforce()` is called by the
-   harness before any stage runs.
+   harness before any stage runs (thread-pinning env vars apply at
+   `scenic.determinism` IMPORT time, before numpy loads BLAS).
 2. **Provenance**: every stage writes `receipt.json` via
-   `scenic.receipts.write_receipt` (schema-validated). Manifest aggregates.
+   `scenic.receipts.write_receipt` (schema-validated; receipts record
+   EXACTLY what the stage consumed and produced). Manifest aggregates AND
+   checks chain coherence (see manifest.build below).
 3. **One stage = one module.** Stages read ONLY prior stages' `out/` dirs and
-   `fixtures`/params; communicate ONLY via on-disk artifacts. No network.
+   `fixtures`/params; communicate ONLY via on-disk artifacts. No network at
+   stage runtime — enforced statically (tools/check_no_network.py, imports +
+   literal dynamic imports) and at runtime (`determinism.block_network()`
+   audit hook raises on any in-process socket.connect; wired by the harness).
 
 ## Run layout
 
@@ -26,9 +32,15 @@ runs/<name>/
 Stage module: `pipeline/sN_name.py` exposing
 `run(run_dir: pathlib.Path, params: dict, ctx: scenic.stage.Ctx) -> None`.
 Register in `pipeline/registry.py` STAGES list (ordered). The harness
-(`scenic/run.py`) creates `<run_dir>/<stage>/out/`, calls `run`, then the
-stage MUST have called `write_receipt` exactly once. CLI for any single
-stage: `uv run python -m scenic.run --run-dir runs/x --pano P --only s2_depth`.
+(`scenic/run.py`) CLEARS the stage's prior state (`receipt.json` + `out/`)
+so the receipt provably comes from this invocation and `out/` holds only
+files this execution wrote, then calls `run`; the stage MUST have called
+`write_receipt` exactly once. CLI for any single stage:
+`uv run python -m scenic.run --run-dir runs/x --pano P --only s2_depth`.
+`--only` refuses to run if the params file differs from the run's
+`params.snapshot.yaml` (a mixed-params chain is unshippable) and deletes
+`manifest.json` afterwards — the next full build re-derives it and the
+coherence check refuses any stale mix a single-stage re-run left behind.
 
 ## Core APIs (scenic/)
 
@@ -41,13 +53,23 @@ stage: `uv run python -m scenic.run --run-dir runs/x --pano P --only s2_depth`.
   gates: list[dict] = [], notes: dict = {})` — paths are hashed and recorded
   RELATIVE to run_dir; `weights_used` are keys into weights/pins.json (hash +
   license id get embedded); `gates` entries must validate as gate_verdict.
-- `manifest.build(run_dir)` — aggregates receipts in registry order into
-  `manifest.json`; raises if any stage receipt missing (incomplete chain =
-  unshippable). `manifest.manifest_hash(run_dir) -> str`.
+- `manifest.build(run_dir, verify_disk=False)` — aggregates receipts in
+  registry order into `manifest.json`; raises if any stage receipt is
+  missing (incomplete chain = unshippable) OR the chain is INCOHERENT:
+  receipt `stage` must match its directory, every in-run-dir input must
+  have a recorded producer, and its sha256 must equal what the producer
+  recorded for that path (a stale mixed chain from an `--only` re-run or a
+  hand-edit is unshippable). `verify_disk=True` additionally re-hashes every
+  recorded output against the file on disk (used at promotion boundaries).
+  Gate counting uses `pass is True` — the receipt schema enforces boolean.
+  `manifest.manifest_hash(run_dir) -> str`.
 - `params.load(path) -> dict` (+ `params_hash`).
 - `determinism.enforce()` — env vars, torch single-thread CPU deterministic,
-  seeds. `determinism.rng(tag: str) -> np.random.Generator` — seeded from
-  (params seed, tag); NEVER use global np.random.
+  seeds. `determinism.block_network()` — idempotent audit hook, raises on
+  any in-process socket.connect (subprocess tools unaffected); the harness
+  installs it at pipeline start. `determinism.rng(tag: str) ->
+  np.random.Generator` — seeded from (params seed, tag); NEVER use global
+  np.random.
 - `weights.load_pins() -> dict` — weights/pins.json {key: {repo, files:
   {relpath: sha256}, license, license_url}}. `weights.local_dir(key) -> Path`
   (verifies hashes; raises if missing/mismatch). `weights.load_depth_model()`,
@@ -103,20 +125,29 @@ s2b, meters after). Invalid/sky = np.inf.
   edited; gates re-run detector==0 and diff-containment when edited).
   Package emit for humans: `package/` (pano + overlay) when persons found.
 - s2_depth: `depth_rel.npy` (sampling res), `sky_mask.png`, `depth_meta.json`
-  (incl. per-face affine coefficients, overlap residuals).
+  (incl. per-face affine coefficients, overlap residuals). Input is
+  `s1_cleanplate/out/pano_clean.png` — REQUIRED (s1 always writes it; a
+  missing clean plate is a broken run, never a silent s0 fallback).
 - s2b_scale: `depth_m.npy`, `scale.json` {scale_factor, plane:{normal,d},
   residual_rel, tilt_deg, camera_height_m, gates…}.
 - s3_layers: `fg_rgb.png fg_depth.npy fg_mask.png bg_rgb.png bg_depth.npy
-  layers.json` (band_px analytic derivation recorded).
+  bg_mask.png layers.json` (band_px analytic derivation recorded). Input
+  pano is the s1 clean plate — REQUIRED, same rule as s2.
 - s4_place: `splats.ply` (3DGS PLY + extra uchar props `layer` 0=fg 1=bg
   2=shell and `origin_stage`), `splats_meta.json`.
-- s6_compress: `scene.ply`, `scene.sog`, `compress.json` (counts per step,
-  stride retries).
-- s7_gates: `verdicts/{hole,jitter,stereo,people,budgets}.json` (schema
-  gate_verdict: {gate, pass, metrics{}, thresholds{}, details}) +
-  `renders/*.png`; receipt embeds all five verdicts in `gates`.
+- s6_compress: per-profile `scene_{review,quest}.ply/_std.ply/.sog` + primary
+  aliases `scene.ply/scene_std.ply/scene.sog`, `compress.json` (per-profile
+  counts, stride retries; see the v2 section).
+- s7_gates: `verdicts/{budgets,fidelity_at_origin,hole,jitter,people,
+  stereo}.json` (schema gate_verdict: {gate, pass, metrics{}, thresholds{},
+  details}) + `renders/*.png`; receipt embeds all six verdicts in `gates`,
+  records the renders as hashed outputs, and records scene.sog + the s1
+  clean plate (fidelity's source) as inputs.
 - s8_review: `index.html` (static, self-contained: base64 PNG renders this
-  run vs runs/_accepted if present, metrics table), `review.json`.
+  run vs runs/_accepted if present, metrics table), `review.json`,
+  `thumbs/`, `scene_review.sog`. Everything whose bytes reach index.html is
+  a receipt input — including the accepted-baseline files (as
+  `external/<name>`) and the s7 layer renders.
 
 ## PLY (scenic/plyio.py)
 
@@ -291,6 +322,16 @@ is unchanged (DA-V2-Small).
 
 ### S7 gates (pipeline/s7_gates.py, gates/) — forensics + fidelity
 
+- View matrix: each of the 7 head-box poses is certified over FIVE views —
+  the 4 pitch-0 yaws PLUS one straight-down view (yaw 0, pitch −90, named
+  `{pose}_down`) — 35 views total for hole/people. The down view closes the
+  nadir blind cone (pitch-0 fov-90 frusta only reach ~−45°; the nadir is
+  where cleanplate/tripod defects live). The hole gate's below-skyline mask
+  is per-pitch (all-True for the down view). Jitter runs its base/offset
+  pair on all 5 center-pose views and gates on the worst energy. Stereo's
+  near-limit is measured over the FULL frame minus a 2-px border (the old
+  central-half window left four ~37° azimuth blind wedges) across the 4 yaw
+  eye-pairs plus two near-limit-only pairs at pitch ±90.
 - Layer forensics (`params.s7.layers`): render origin (center pose, the 4 yaw
   ring) THREE extra times per yaw with only fg, only bg, only shell splats
   (filter by layer), save to out/renders/ as
@@ -301,8 +342,8 @@ is unchanged (DA-V2-Small).
 - NEW GATE `fidelity_at_origin` (gates/fidelity.py): for each view from
   metrics.equirect_tile_views(s7.fidelity.tiles_lon, tiles_lat) at
   s7.fidelity.render_px, render the PRIMARY splats from the origin and sample
-  the SOURCE pano (s1 clean if present else s0 pano) into the same
-  perspective; SSIM per tile. Report worst tile + mean. PASS iff worst >=
+  the SOURCE pano (the s1 clean plate — REQUIRED, never a silent s0
+  fallback) into the same perspective; SSIM per tile. Report worst tile + mean. PASS iff worst >=
   ssim_worst_tile_min AND mean >= ssim_mean_min (SSIM enforced). LPIPS:
   if lpips_advisory_available() compute + report as an advisory metric
   `lpips_mean`; else metrics get `lpips: "advisory_unavailable"` and a reason
@@ -342,6 +383,21 @@ is unchanged (DA-V2-Small).
   fidelity_at_origin mean SSIM (desc), tie-break worst-tile SSIM. Emit a
   ranked table (stdout + runs/_sweep/report.json). Deterministic given the
   grid. `make sweep FIXTURE=fixtures/ci_tiny.jpg`.
+
+## Baseline acceptance (runs/_accepted, `make accept`)
+
+`make accept RUN=runs/<name> [FORCE=1]` (tools/accept_run.py) promotes a
+completed run to the `runs/_accepted` baseline that s8_review compares
+against. It re-derives the manifest from the receipts with
+`manifest.build(run_dir, verify_disk=True)` — an incomplete/incoherent chain
+or a tampered artifact refuses; a hand-edited manifest.json is overwritten
+with receipt truth. `shippable=false` runs refuse unless FORCE=1 (gates
+record verdicts, humans decide; the promotion is recorded honestly in
+`accepted.json`, schema `accepted`). The baseline is a SLIM snapshot
+(s8_review + manifest.json + params.snapshot.yaml + accepted.json), staged
+in a per-process dir and swapped atomically; it is deliberately NOT a full
+run copy. s8 records the baseline files it embeds as receipt inputs, so a
+baseline change is attributable in any manifest diff.
 
 ## Testing
 

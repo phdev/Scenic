@@ -15,8 +15,10 @@ band so no spurious cross edges appear:
         visibility test must drop it (no band).
 
 Verifies edge/ratio/visibility gating, the capped analytic band width, the
-push-pull far-side fill, the bg_solid_angle gate + schema, no NaN, and
-bit-identical determinism across runs.
+push-pull far-side fill, the bg_solid_angle gate + schema, no NaN,
+bit-identical determinism across runs, and that s1's pano_clean.png is a HARD
+requirement (a deliberately different un-cleaned s0 pano proves the clean
+plate is the one consumed; a missing clean plate raises, never falls back).
 """
 from __future__ import annotations
 
@@ -93,13 +95,17 @@ def make_scene() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return depth, sky, rgb
 
 
-def make_run(run_dir: Path, with_cleanplate: bool = False) -> None:
+def make_run(run_dir: Path, with_cleanplate: bool = True) -> None:
     depth, sky, rgb = make_scene()
     for d in ["s2b_scale/out", "s2_depth/out", "s0_ingest/out"]:
         (run_dir / d).mkdir(parents=True)
     imageio.save_npy(run_dir / "s2b_scale/out/depth_m.npy", depth)
     imageio.save_mask_png(run_dir / "s2_depth/out/sky_mask.png", sky)
-    imageio.save_png(run_dir / "s0_ingest/out/pano.png", rgb)
+    # the un-cleaned s0 pano deliberately DIFFERS from the clean plate so the
+    # fg_rgb assertions prove s3 consumed pano_clean.png, never the s0 pano
+    dirty = rgb.copy()
+    dirty[:4, :4] = 255
+    imageio.save_png(run_dir / "s0_ingest/out/pano.png", dirty)
     if with_cleanplate:
         (run_dir / "s1_cleanplate/out").mkdir(parents=True)
         imageio.save_png(run_dir / "s1_cleanplate/out/pano_clean.png", rgb)
@@ -214,11 +220,11 @@ def test_band_derivation_records_cap_when_clamped():
 
     with tempfile.TemporaryDirectory() as td:
         d = Path(td) / "run"
-        for sub in ["s2b_scale/out", "s2_depth/out", "s0_ingest/out"]:
+        for sub in ["s2b_scale/out", "s2_depth/out", "s1_cleanplate/out"]:
             (d / sub).mkdir(parents=True)
         imageio.save_npy(d / "s2b_scale/out/depth_m.npy", depth)
         imageio.save_mask_png(d / "s2_depth/out/sky_mask.png", sky)
-        imageio.save_png(d / "s0_ingest/out/pano.png", rgb)
+        imageio.save_png(d / "s1_cleanplate/out/pano_clean.png", rgb)
         run_stage(d)
         layers = schema.read_validated(d / "s3_layers/out/layers.json", "layers")
     assert layers["band_px"] == 64
@@ -292,7 +298,9 @@ def test_receipt_written_with_params_used(run_dir):
     assert set(rec["params_used"]) == {"head_box", "s3", "s7"}
     assert rec["params_used"]["s7"] == {"squat_y_m": -0.9}
     assert rec["weights"] == []
-    assert rec["notes"]["pano_source"] == "s0_ingest"
+    assert rec["notes"]["pano_source"] == "s1_cleanplate"
+    # the consumed pano is s1's clean plate under its run-relative path
+    assert rec["inputs"]["pano"]["path"] == "s1_cleanplate/out/pano_clean.png"
     assert set(rec["outputs"]) == {
         "fg_rgb", "fg_depth", "fg_mask", "bg_rgb", "bg_depth", "bg_mask", "layers",
     }
@@ -300,12 +308,14 @@ def test_receipt_written_with_params_used(run_dir):
         assert not v["path"].startswith("/")
 
 
-def test_cleanplate_pano_preferred(tmp_path):
+def test_missing_cleanplate_raises(tmp_path):
+    # s1 ALWAYS writes pano_clean.png in a complete run; a missing file means a
+    # broken run dir and must be a hard error — silently falling back to the
+    # un-cleaned s0 pano would only mask it.
     d = tmp_path / "run"
-    make_run(d, with_cleanplate=True)
-    run_stage(d)
-    rec = receipts.read_receipt(d, "s3_layers")
-    assert rec["notes"]["pano_source"] == "s1_cleanplate"
+    make_run(d, with_cleanplate=False)
+    with pytest.raises(FileNotFoundError, match="pano_clean"):
+        run_stage(d)
 
 
 def test_determinism_double_run_identical_bytes(run_dir, tmp_path):

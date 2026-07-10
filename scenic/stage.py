@@ -1,4 +1,9 @@
-"""Stage context passed by the harness to every stage's run()."""
+"""Stage context passed by the harness to every stage's run().
+
+Ctx.out only ensures the dir exists; CLEARING stale state (receipt.json and
+the out/ tree) is the harness's job (scenic/run.py), done once per stage
+invocation — Ctx.out may be called repeatedly within a stage (e.g. s6's
+re-entrant s4 re-run) and must never wipe in-progress work."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field

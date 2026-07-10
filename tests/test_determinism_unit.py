@@ -12,11 +12,14 @@ Covers the three cross-cutting invariants CI leans on:
 3. After determinism.enforce(), a fixed torch conv on fixed input yields a
    bit-identical result across two fresh subprocesses.
 
-Also guards tools/check_no_network.py (the CI no-network static gate).
+Also guards tools/check_no_network.py (the CI no-network static gate) and
+the scenic.determinism runtime guards (block_network audit hook, env-var
+pinning BEFORE numpy import) — both via fresh subprocesses.
 """
 from __future__ import annotations
 
 import ast
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -241,3 +244,64 @@ def test_no_network_guard_ignores_comments_and_docstrings(tmp_path):
         text=True,
     )
     assert out.returncode == 0, out.stdout + out.stderr
+
+
+# ---------------------------------------------------------------------------
+# scenic.determinism runtime guards (fresh subprocesses on purpose:
+# block_network's audit hook is process-permanent and would poison every
+# later socket use in the pytest process; the env-var ordering can only be
+# observed at first import)
+# ---------------------------------------------------------------------------
+
+_BLOCK_NET_SNIPPET = """
+import socket
+from scenic import determinism
+determinism.block_network()
+determinism.block_network()  # idempotent: second call must not stack a hook
+s = socket.socket()
+try:
+    try:
+        s.connect(("127.0.0.1", 9))
+    except RuntimeError as e:
+        print("BLOCKED", e)
+    except OSError as e:
+        # hook did NOT fire — the connect actually went out
+        print("NOT_BLOCKED", type(e).__name__)
+    else:
+        print("NOT_BLOCKED connected")
+finally:
+    s.close()
+"""
+
+
+def test_block_network_raises_on_socket_connect():
+    out = subprocess.run(
+        [sys.executable, "-c", _BLOCK_NET_SNIPPET],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    line = out.stdout.strip().splitlines()[-1]
+    assert line.startswith("BLOCKED"), out.stdout + out.stderr
+    assert "127.0.0.1" in line  # the address is named in the message
+
+
+def test_thread_env_pinned_before_numpy_in_fresh_process():
+    # Importing scenic.determinism alone must set the thread-pinning vars —
+    # at MODULE level, before its own numpy import reaches BLAS init.
+    env = os.environ.copy()
+    env.pop("OMP_NUM_THREADS", None)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import scenic.determinism, os; print(os.environ['OMP_NUM_THREADS'])",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert out.stdout.strip() == "1"

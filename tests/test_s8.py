@@ -7,15 +7,17 @@ Fixture: a fake run dir with
   * scene.ply (primary/quest alias) + scene_review.*/scene_quest.* files,
   * s7 layer renders center_yaw{NNN}_layer_{fg,bg,shell}.png.
 
-No base s7 center_yaw{NNN}.png -> s8 renders the 4 standard views itself.
+The 4 standard views are ALWAYS rendered from scene.ply; stale
+center_yaw{NNN}.png debris in s7's renders dir must be ignored.
 
 Covered: outputs + schema validity, page contents (all six gate names, base64
 data URIs, params hash, SuperSplat footer, PASS+FAIL, the fg/bg/shell toggle,
 the sog byte-ratio, the copied scene_review.sog viewer reference), review.json
 with layers + sog_ssim + profiles, double-run byte-identical index.html across
-DIFFERENT run dirs, the runs/_accepted side-by-side flow, missing-layer
-placeholder, byte-for-byte reuse of s7 renders, receipt shape, and hard errors
-on missing inputs.
+DIFFERENT run dirs, the runs/_accepted side-by-side flow (incl. the baseline
+files recorded as receipt inputs), missing-layer placeholder, stale-debris
+immunity, receipt shape (incl. layer_* inputs with run-relative s7 paths), and
+hard errors on missing inputs.
 """
 from __future__ import annotations
 
@@ -325,6 +327,11 @@ def test_missing_layer_render_placeholder(tmp_path):
     r = schema.read_validated(out(d) / "review.json", "review")
     assert "center_yaw090_layer_bg.png" not in r["layers"]
     assert len(r["layers"]) == len(YAWS) * len(LAYERS) - 1
+    # only EXISTING renders are receipt inputs (receipts record what was read)
+    rec = receipts.read_receipt(d, "s8_review")
+    assert "layer_90_bg" not in rec["inputs"]
+    layer_keys = {k for k in rec["inputs"] if k.startswith("layer_")}
+    assert len(layer_keys) == len(YAWS) * len(LAYERS) - 1
 
 
 def test_no_layer_renders_all_placeholders(tmp_path):
@@ -336,6 +343,8 @@ def test_no_layer_renders_all_placeholders(tmp_path):
     assert text.count("missing</div>") == len(YAWS) * len(LAYERS)
     r = schema.read_validated(out(d) / "review.json", "review")
     assert r["layers"] == []
+    rec = receipts.read_receipt(d, "s8_review")
+    assert not any(k.startswith("layer_") for k in rec["inputs"])
 
 
 def test_accepted_side_by_side(tmp_path):
@@ -374,7 +383,12 @@ def test_accepted_incomplete_ignored(tmp_path):
     assert "no accepted baseline" in (out(d) / "index.html").read_text()
 
 
-def test_reuses_s7_renders_byte_identical(tmp_path):
+def test_stale_s7_render_debris_ignored(tmp_path):
+    # No current s7 output matches the standard view names (hole writes the
+    # magenta-dyed center_yawNNN_magenta.png, people center_yawNNN_normal.png),
+    # so a center_yawNNN.png in the renders dir can only be stale debris from a
+    # reused run dir — it must NEVER become the shipped thumbnail. s8 always
+    # renders the 4 views from scene.ply.
     d = tmp_path / "run"
     make_run(d)
     rdir = d / "s7_gates" / "out" / "renders"
@@ -384,11 +398,18 @@ def test_reuses_s7_renders_byte_identical(tmp_path):
         imageio.save_png(rdir / f"center_yaw{y:03d}.png", arr)
     run_stage(d)
     r = schema.read_validated(out(d) / "review.json", "review")
-    assert all(p["source"] == "s7_renders" for p in r["poses"])
+    assert all(p["source"] == "rendered" for p in r["poses"])
     for y in YAWS:
-        assert (out(d) / "thumbs" / f"{y}.png").read_bytes() == (
+        thumb = imageio.load_rgb(out(d) / "thumbs" / f"{y}.png")
+        assert thumb.shape == (PX, PX, 3)  # real render, not the 8x8 debris
+        assert (out(d) / "thumbs" / f"{y}.png").read_bytes() != (
             rdir / f"center_yaw{y:03d}.png"
         ).read_bytes()
+    # the debris is not embedded in the page either
+    text = (out(d) / "index.html").read_text()
+    for y in YAWS:
+        png = (rdir / f"center_yaw{y:03d}.png").read_bytes()
+        assert base64.b64encode(png).decode("ascii") not in text
 
 
 def test_receipt(run_dir):
@@ -396,6 +417,7 @@ def test_receipt(run_dir):
     assert set(rec["inputs"]) == (
         {"scene", "scene_review_sog", "compress"}
         | {f"verdict_{g}" for g in GATES}
+        | {f"layer_{y}_{layer}" for y in YAWS for layer in LAYERS}
     )
     assert set(rec["outputs"]) == {"index", "review", "viewer_sog"} | {
         f"thumb_{y}" for y in YAWS
@@ -411,6 +433,42 @@ def test_receipt(run_dir):
     assert rec["notes"]["sog_ssim"] is None
     for v in list(rec["inputs"].values()) + list(rec["outputs"].values()):
         assert not v["path"].startswith("/")
+
+
+def test_receipt_records_layer_render_inputs(run_dir):
+    # every s7 layer render embedded in index.html is a receipt input, recorded
+    # under its real run-relative path (so the manifest hash-coherence check
+    # can match it against s7's recorded output) with the real byte hash.
+    rec = receipts.read_receipt(run_dir, "s8_review")
+    for y in YAWS:
+        for layer in LAYERS:
+            entry = rec["inputs"][f"layer_{y}_{layer}"]
+            rel = f"s7_gates/out/renders/center_yaw{y:03d}_layer_{layer}.png"
+            assert entry["path"] == rel
+            assert entry["sha256"] == hashing.sha256_file(run_dir / rel)
+
+
+def test_receipt_records_accepted_baseline_inputs(tmp_path):
+    # the accepted-baseline bytes are embedded in the hashed index.html, so
+    # promoting a baseline must be attributable: when compared=True the five
+    # baseline files are receipt inputs (external/<name> entries, real sha256).
+    a, b = tmp_path / "a", tmp_path / "b"
+    make_run(a)
+    run_stage(a)
+    rec_a = receipts.read_receipt(a, "s8_review")
+    assert not any(k.startswith("accepted_") for k in rec_a["inputs"])
+    shutil.copytree(a / "s8_review", tmp_path / "_accepted" / "s8_review")
+    make_run(b)
+    run_stage(b)
+    rec_b = receipts.read_receipt(b, "s8_review")
+    acc_out = tmp_path / "_accepted" / "s8_review" / "out"
+    expected = {"accepted_review": acc_out / "review.json"}
+    for y in YAWS:
+        expected[f"accepted_thumb_{y}"] = acc_out / "thumbs" / f"{y}.png"
+    for key, src in expected.items():
+        entry = rec_b["inputs"][key]
+        assert entry["path"] == f"external/{src.name}"
+        assert entry["sha256"] == hashing.sha256_file(src)
 
 
 def test_missing_verdict_raises(tmp_path):

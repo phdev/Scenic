@@ -1,7 +1,8 @@
 """People gate: no recognizable person may survive into the shipped scene.
 
-Renders all 7x4 head-box views with normal colors (uint8) and runs the
-pinned RT-DETR person detector (weights key rtdetr_r18; CPU, deterministic,
+Renders all 7x5 head-box views (the 4-yaw pitch-0 ring + the straight-down
+nadir view per pose) with normal colors (uint8) and runs the pinned RT-DETR
+person detector (weights key rtdetr_r18; CPU, deterministic,
 scenic.determinism.enforce() first, torch.no_grad()). Detections are
 post-processed at threshold 0 so the max person score is observable even
 when no detection crosses the gate threshold.
@@ -9,8 +10,8 @@ when no detection crosses the gate threshold.
 FAIL if any person detection scores >= s7.people_score_min in any view.
 Metrics: max_score (0.0 if none), n_detections (count at/above threshold).
 
-Diagnostics: center-pose normal-color renders (all 4 yaws, reused by s8)
-under outdir/renders/.
+Diagnostics: center-pose normal-color renders (all 4 yaws, reused by s8,
+plus the down view) under outdir/renders/.
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ from pathlib import Path
 from scenic import determinism, weights
 from scenic.plyio import SplatData
 
-from gates import YAWS_DEG, head_box_poses, render_view, save_render, view_name
+from gates import head_box_poses, pose_views, render_view, save_render, view_name
 
 
 def run_gate(splats: SplatData, params: dict, outdir: Path | str) -> dict:
@@ -38,12 +39,16 @@ def run_gate(splats: SplatData, params: dict, outdir: Path | str) -> dict:
     max_score = 0.0
     n_detections = 0
     for pose_name, pos in head_box_poses(params):
-        for yaw in YAWS_DEG:
-            name = view_name(pose_name, yaw)
-            out = render_view(splats, params, pos, yaw)
+        for yaw, pitch in pose_views():
+            name = view_name(pose_name, yaw, pitch)
+            out = render_view(splats, params, pos, yaw, pitch)
             if pose_name == "center":
-                save_render(outdir, f"center_yaw{int(yaw):03d}_normal.png",
-                            out["rgb"])
+                save_render(
+                    outdir,
+                    ("center_down_normal.png" if pitch != 0.0
+                     else f"center_yaw{int(yaw):03d}_normal.png"),
+                    out["rgb"],
+                )
             inputs = proc(images=Image.fromarray(out["rgb"]),
                           return_tensors="pt")
             with torch.no_grad():

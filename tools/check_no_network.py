@@ -1,12 +1,30 @@
 """Static no-network guard (CI step, after license_guard).
 
 Contract (docs/CONTRACTS.md, CLAUDE.md): no network at stage runtime. This
-guard AST-parses every .py under pipeline/, gates/, and scenic/ and flags any
-Import / ImportFrom of network-capable modules: urllib (any submodule),
-requests, http.client, and socket.
+guard AST-parses every .py under pipeline/, gates/, and scenic/ and flags:
+
+- Import / ImportFrom of network-capable modules (FORBIDDEN below): the
+  stdlib clients (urllib, http — client AND server, socket, socketserver,
+  ftplib, smtplib, poplib, imaplib, telnetlib, xmlrpc) plus the third-party
+  clients installed or installable via the lockfile (urllib3, requests,
+  huggingface_hub, aiohttp, httpx, pycurl, websockets). urllib3 matters: it
+  is a transitive dep in uv.lock, imports fine, and is NOT neutralized by
+  HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE.
+- Dynamic imports with LITERAL names: importlib.import_module("X") and
+  __import__("X") where the first argument is a string constant matching
+  FORBIDDEN (a bare import_module("X") from `from importlib import
+  import_module` is caught too).
+
+Honest boundary of static analysis: dynamic imports with NON-literal names
+(importlib.import_module(some_var)) and subprocess-based network (curl, wget)
+are invisible here. The complementary RUNTIME layer is
+scenic.determinism.block_network() — a sys.addaudithook that raises on the
+"socket.connect" audit event — which the harness wires in at process start.
 
 Exemptions:
-- scenic/weights.py (weight loading may reference offline-mode plumbing)
+- scenic/weights.py (weight loading may reference offline-mode plumbing;
+  huggingface_hub in FORBIDDEN still stops OTHER files from quietly growing
+  a hub dependency)
 - tools/ is not scanned at all (fetch_weights.py legitimately downloads at
   setup time)
 
@@ -32,9 +50,28 @@ SCAN_DIRS = ("pipeline", "gates", "scenic")
 EXEMPT = {Path("scenic") / "weights.py"}
 
 # Forbidden import roots. A dotted module matches if it equals the entry or
-# starts with "<entry>.", so `urllib` catches urllib.request etc., while
-# `http.client` catches http.client but not http.server (add if ever needed).
-FORBIDDEN = ("urllib", "requests", "http.client", "socket")
+# starts with "<entry>.", so `urllib` catches urllib.request etc. and `http`
+# catches http.client AND http.server. (`httpx` does not match `http` — no
+# dot — hence its own entry.)
+FORBIDDEN = (
+    "urllib",
+    "urllib3",
+    "requests",
+    "http",
+    "socket",
+    "socketserver",
+    "ftplib",
+    "smtplib",
+    "poplib",
+    "imaplib",
+    "telnetlib",
+    "xmlrpc",
+    "huggingface_hub",
+    "aiohttp",
+    "httpx",
+    "pycurl",
+    "websockets",
+)
 
 
 def _matches(module: str) -> str | None:
@@ -44,9 +81,30 @@ def _matches(module: str) -> str | None:
     return None
 
 
-def _check_file(path: Path) -> list[str]:
-    rel = path.relative_to(REPO_ROOT)
-    tree = ast.parse(path.read_text(), filename=str(rel))
+def _dynamic_import_literal(node: ast.Call) -> str | None:
+    """Return the literal module name if `node` is importlib.import_module("X"),
+    import_module("X"), or __import__("X"); None otherwise. Non-literal first
+    arguments are out of scope for static analysis (see module docstring)."""
+    func = node.func
+    is_dyn = (
+        isinstance(func, ast.Name) and func.id in ("__import__", "import_module")
+    ) or (
+        isinstance(func, ast.Attribute)
+        and func.attr == "import_module"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "importlib"
+    )
+    if not is_dyn or not node.args:
+        return None
+    arg = node.args[0]
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+        return arg.value
+    return None
+
+
+def check_source(source: str, display_name: str) -> list[str]:
+    """Core checker: findings for one file's source text. Import-testable."""
+    tree = ast.parse(source, filename=display_name)
     findings: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -54,7 +112,8 @@ def _check_file(path: Path) -> list[str]:
                 hit = _matches(alias.name)
                 if hit:
                     findings.append(
-                        f"{rel}:{node.lineno}: import {alias.name} (forbidden: {hit})"
+                        f"{display_name}:{node.lineno}: import {alias.name}"
+                        f" (forbidden: {hit})"
                     )
         elif isinstance(node, ast.ImportFrom):
             if node.level:  # relative import — always in-repo, never stdlib net
@@ -63,7 +122,8 @@ def _check_file(path: Path) -> list[str]:
             hit = _matches(module)
             if hit:
                 findings.append(
-                    f"{rel}:{node.lineno}: from {module} import ... (forbidden: {hit})"
+                    f"{display_name}:{node.lineno}: from {module} import ..."
+                    f" (forbidden: {hit})"
                 )
                 continue
             # `from urllib import request`, `from http import client`
@@ -72,10 +132,30 @@ def _check_file(path: Path) -> list[str]:
                 hit = _matches(full)
                 if hit:
                     findings.append(
-                        f"{rel}:{node.lineno}: from {module} import {alias.name}"
-                        f" (forbidden: {hit})"
+                        f"{display_name}:{node.lineno}: from {module} import"
+                        f" {alias.name} (forbidden: {hit})"
                     )
+        elif isinstance(node, ast.Call):
+            name = _dynamic_import_literal(node)
+            if name is None:
+                continue
+            hit = _matches(name)
+            if hit:
+                callee = (
+                    node.func.id
+                    if isinstance(node.func, ast.Name)
+                    else "importlib.import_module"
+                )
+                findings.append(
+                    f"{display_name}:{node.lineno}: {callee}({name!r})"
+                    f" (forbidden: {hit})"
+                )
     return findings
+
+
+def _check_file(path: Path) -> list[str]:
+    rel = path.relative_to(REPO_ROOT)
+    return check_source(path.read_text(), str(rel))
 
 
 def main() -> int:

@@ -6,9 +6,9 @@ Gates never abort the pipeline: failures become `pass: false` verdicts; hard
 errors (missing files, schema violations) raise.
 
 This package also hosts the helpers shared by all gates: the 7 head-box
-poses, the fixed 4-yaw view ring, the render wrapper, and the magenta-shell
-color override. Geometry follows docs/CONTRACTS.md (+Y up, camera looks +Z,
-yaw toward +X).
+poses, the fixed per-pose view set (4-yaw pitch-0 ring + one straight-down
+nadir view), the render wrapper, and the magenta-shell color override.
+Geometry follows docs/CONTRACTS.md (+Y up, camera looks +Z, yaw toward +X).
 
 Owner: this module owns gates/*.py, pipeline/s7_gates.py and
 tests/test_s7.py only.
@@ -35,8 +35,13 @@ GATE_ORDER = (
     "hole", "jitter", "stereo", "people", "budgets", "fidelity_at_origin",
 )
 
-# Views per pose: yaw ring at pitch 0 (fov/res come from params s7).
+# Views per pose: yaw ring at pitch 0 (fov/res come from params s7). The
+# pitch-0 fov-90 ring only covers ray pitches down to about -45 deg, so the
+# standard view set (pose_views) adds one straight-down view per pose — the
+# nadir is exactly where real defects live (tripod/watermark cleanplate
+# region; the head box includes looking down).
 YAWS_DEG = (0.0, 90.0, 180.0, 270.0)
+DOWN_VIEW = (0.0, -90.0)  # (yaw_deg, pitch_deg) straight-down nadir view
 
 # Layer forensics: (layer value, short name), in the fixed fg -> bg -> shell
 # order used for the origin layer renders and the receipt notes.
@@ -66,8 +71,19 @@ def head_box_poses(params: dict) -> list[tuple[str, np.ndarray]]:
     ]
 
 
-def view_name(pose_name: str, yaw_deg: float) -> str:
-    return f"{pose_name}_yaw{int(round(yaw_deg)):03d}"
+def pose_views() -> list[tuple[float, float]]:
+    """The standard (yaw_deg, pitch_deg) view set per head-box pose: the 4
+    pitch-0 yaws plus the straight-down nadir view. Fixed, deterministic
+    order."""
+    return [(yaw, 0.0) for yaw in YAWS_DEG] + [DOWN_VIEW]
+
+
+def view_name(pose_name: str, yaw_deg: float, pitch_deg: float = 0.0) -> str:
+    """Stable view id: `{pose}_yawNNN` on the pitch-0 ring, `{pose}_down`
+    for the straight-down view."""
+    if pitch_deg == 0.0:
+        return f"{pose_name}_yaw{int(round(yaw_deg)):03d}"
+    return f"{pose_name}_down"
 
 
 def render_view(
@@ -75,15 +91,16 @@ def render_view(
     params: dict,
     pos: np.ndarray,
     yaw_deg: float,
+    pitch_deg: float = 0.0,
     override_rgb: np.ndarray | None = None,
 ) -> dict:
-    """Render one square head-box view (pitch 0) at params s7 fov/res."""
+    """Render one square head-box view at params s7 fov/res."""
     s7 = params["s7"]
     px = int(s7["render_px"])
     cam = Camera(
         pos=np.asarray(pos, dtype=np.float64).reshape(3),
         yaw=float(np.deg2rad(yaw_deg)),
-        pitch=0.0,
+        pitch=float(np.deg2rad(pitch_deg)),
     )
     return render(
         splats, cam, px, px, float(s7["render_fov_deg"]), override_rgb=override_rgb

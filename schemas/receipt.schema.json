@@ -31,7 +31,19 @@
         }
       }
     },
-    "gates": {"type": "array", "items": {"type": "object"}},
+    "gates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["gate", "pass", "metrics", "thresholds"],
+        "properties": {
+          "gate": {"type": "string"},
+          "pass": {"type": "boolean"},
+          "metrics": {"type": "object"},
+          "thresholds": {"type": "object"}
+        }
+      }
+    },
     "notes": {"type": "object"}
   },
   "$defs": {
@@ -43,7 +55,16 @@
         "required": ["path", "sha256"],
         "additionalProperties": false,
         "properties": {
-          "path": {"type": "string", "pattern": "^[^/].*", "not": {"pattern": "^([A-Za-z]:)?/"}},
+          "path": {
+            "type": "string",
+            "pattern": "^[^/\\\\][^\\\\]*$",
+            "not": {
+              "anyOf": [
+                {"pattern": "(^|/)\\.\\.(/|$)"},
+                {"pattern": "^[A-Za-z]:"}
+              ]
+            }
+          },
           "sha256": {"$ref": "#/$defs/sha256"}
         }
       }
